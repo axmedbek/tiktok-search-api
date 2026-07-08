@@ -11,9 +11,6 @@ counts, music, etc.), flattened to a stable schema, over a small FastAPI service
 - Multi-device pool with budget-aware load balancing + optional per-device proxies
 - Auto-generated interactive docs at `/docs`
 
-> ⚠️ Accessing TikTok's private API violates its ToS and is a legal gray area.
-> For research / authorized use on public data only. Review your obligations.
-
 ---
 
 ## 1. Requirements
