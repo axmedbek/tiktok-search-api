@@ -1,0 +1,79 @@
+# =====================================================================
+# TikTok SIGNED search API config
+# =====================================================================
+# Consumed by the `tiktoksearch` package (PoolConfig.load_yaml). Pure-Python
+# request signing -> api.tiktokv.com. No phone, no Appium.
+# Run:  python mobile/api_signed.py --config mobile/config_signed.yaml
+# Docs: mobile/tiktoksearch/docs/API_REFERENCE.md  (or GET /docs when running)
+#
+# Search FILTERS are per-request (not configured here) — see the API reference.
+
+# --- Rate / budget (PER DEVICE) --------------------------------------
+# Each device identity gets its own per-UTC-day cap. Total daily capacity =
+# number of devices × this. With 5 devices × 300 = 1500 searches/day.
+daily_request_cap_per_device: 300
+acquire_timeout_s: 60         # wait for a free (idle, budgeted) device before 503
+
+# --- Per-search --------------------------------------------------------
+max_results_per_search: 60    # hard ceiling on `limit`
+request_timeout_s: 20         # per HTTP request to TikTok
+retries: 2                    # retry/host-rotate on transient errors
+
+# --- DEVICES ----------------------------------------------------------
+# The pool balances /search across all devices (least-recently-used with budget
+# left). Two ways to add devices, combinable:
+#
+#   devices:            explicit identities — use REAL device_id/iid captured
+#                       from your own phones' traffic (see recon/). Each entry
+#                       may override any app-version field below.
+#   synthetic_devices:  N auto-generated random identities for TESTING. Random
+#                       ids work but rate-limit sooner — replace with real ones
+#                       for steady use.
+#
+# For now (testing): 5 synthetic devices so you can exercise balancing.
+synthetic_devices: 5
+
+devices: []
+
+# --- PROXIES (IP isolation) ------------------------------------------
+# The single biggest anti-block lever. Without proxies every device egresses
+# through THIS host's one IP — TikTok sees many device_ids from one IP and
+# rate-limits (429) the whole IP. With proxies, each device gets its own IP, so
+# the fleet looks like separate phones on separate networks.
+#
+# The pool assigns proxies round-robin: device #1 -> proxies[0], #2 -> [1], …
+# (wraps if fewer proxies than devices). A device with its own `proxy:` keeps it.
+# Use RESIDENTIAL/mobile proxies — datacenter IPs are routinely blocked by TikTok.
+# Format: "scheme://[user:pass@]host:port"  (http/https/socks5).
+# Leave empty to run direct (fine for light testing from one IP).
+proxies: []
+# Example:
+# proxies:
+#   - "http://user:pass@gate.residential-provider.com:7001"
+#   - "http://user:pass@gate.residential-provider.com:7002"
+#   - "socks5://user:pass@1.2.3.4:1080"
+# Example of real devices (uncomment + fill from recon captures):
+# devices:
+#   - device_id: "7100000000000000001"
+#     iid:       "7100000000000000101"
+#   - device_id: "7100000000000000002"
+#     iid:       "7100000000000000102"
+#     app_version: "33.1.0"        # optional per-device override
+#     version_code: "330100"
+
+# --- App / client version defaults (match a real TikTok Android build) -
+app_id: 1233                  # 1233 = musical.ly (global TikTok)
+app_version: "32.9.4"
+version_code: "320904"
+sdk_version: "v04.04.09-boa-hotfix"
+sdk_version_code: 41090
+license_id: 11512
+device_type: "SM-A207F"
+os_version: "11"
+channel: "googleplay"
+
+# --- API hosts (rotated on retry) ------------------------------------
+api_hosts:
+  - "https://api16-normal-c-useast1a.tiktokv.com"
+  - "https://api16-normal-c-useast2a.tiktokv.com"
+  - "https://api19-normal-c-useast1a.tiktokv.com"

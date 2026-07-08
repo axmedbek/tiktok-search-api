@@ -1,0 +1,20 @@
+[project]
+name = "tiktoksearch"
+version = "2.0.0"
+description = "Signed, phone-free access to TikTok's mobile search API (keyword / hashtag / user) with filters."
+requires-python = ">=3.11"
+dependencies = [
+    "requests[socks]",
+    "pycryptodome",   # AES, used by the vendored signer
+    "gmssl",          # SM3 hash, used by X-Argus
+    "PyYAML",
+    "fastapi",
+    "uvicorn",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

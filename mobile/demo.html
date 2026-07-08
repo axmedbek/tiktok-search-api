@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>TikTok Search API — Demo</title>
+<style>
+  :root{
+    --bg:#0b0d10; --card:#15181d; --card2:#1b1f26; --line:#272c34;
+    --txt:#e8eaed; --muted:#9aa3ad; --accent:#25f4ee; --accent2:#fe2c55;
+    --ok:#3ddc84;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f4f6f8; --card:#fff; --card2:#f0f2f5; --line:#e2e6ea;
+      --txt:#14181d; --muted:#5b6570; --accent:#0aa; --accent2:#fe2c55; --ok:#128a4a; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+  .wrap{max-width:920px;margin:0 auto;padding:28px 18px 60px;}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:6px;}
+  h1{font-size:22px;margin:0;font-weight:700;letter-spacing:-.3px;}
+  .logo{width:34px;height:34px;border-radius:9px;
+    background:linear-gradient(135deg,var(--accent2),var(--accent));
+    display:grid;place-items:center;font-weight:800;color:#fff;}
+  .sub{color:var(--muted);margin:2px 0 22px;font-size:13.5px;}
+  .status{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;
+    color:var(--muted);background:var(--card);border:1px solid var(--line);
+    padding:5px 11px;border-radius:20px;margin-left:auto;}
+  .dot{width:8px;height:8px;border-radius:50%;background:#888;}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent);}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:16px;margin-bottom:20px;}
+  .tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;}
+  .tab{padding:8px 15px;border-radius:10px;border:1px solid var(--line);
+    background:var(--card2);color:var(--muted);cursor:pointer;font-weight:600;font-size:13.5px;}
+  .tab.active{background:var(--txt);color:var(--bg);border-color:var(--txt);}
+  .viewtoggle{margin-left:auto;display:flex;gap:3px;background:var(--card2);
+    border:1px solid var(--line);border-radius:10px;padding:3px;}
+  .vt{padding:5px 12px;border-radius:8px;cursor:pointer;color:var(--muted);
+    font-weight:600;font-size:12.5px;}
+  .vt.active{background:var(--accent);color:#001;}
+  .filters{display:flex;gap:14px;margin-top:12px;flex-wrap:wrap;}
+  .filters label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted);font-weight:600;}
+  .filters select{padding:8px 10px;border-radius:9px;border:1px solid var(--line);
+    background:var(--bg);color:var(--txt);font-size:13.5px;outline:none;cursor:pointer;}
+  .filters select:focus{border-color:var(--accent);}
+  .filters.hidden{display:none;}
+  pre.json{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:16px;overflow-x:auto;font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:var(--txt);white-space:pre;margin:0;}
+  .json .k{color:var(--accent2);} .json .s{color:var(--ok);}
+  .json .n{color:var(--accent);} .json .b{color:#c792ea;}
+  .row{display:flex;gap:10px;}
+  input[type=text]{flex:1;padding:13px 15px;border-radius:11px;border:1px solid var(--line);
+    background:var(--bg);color:var(--txt);font-size:15px;outline:none;}
+  input[type=text]:focus{border-color:var(--accent);}
+  button.go{padding:0 22px;border:0;border-radius:11px;font-weight:700;font-size:14.5px;
+    cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--accent2),#ff5c78);}
+  button.go:disabled{opacity:.5;cursor:default;}
+  .meta{color:var(--muted);font-size:12.5px;margin:14px 2px 10px;min-height:16px;}
+  .grid{display:grid;gap:12px;}
+  .item{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;}
+  .item .top{display:flex;align-items:center;gap:9px;margin-bottom:8px;}
+  .av{width:30px;height:30px;border-radius:50%;background:var(--card2);
+    display:grid;place-items:center;font-weight:700;color:var(--accent);font-size:13px;}
+  .uname{font-weight:700;}
+  .verified{color:var(--accent);font-size:12px;}
+  .desc{color:var(--txt);margin:2px 0 10px;font-size:14px;}
+  .stats{display:flex;flex-wrap:wrap;gap:14px;color:var(--muted);font-size:12.5px;}
+  .stats b{color:var(--txt);font-weight:700;}
+  .tags{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px;}
+  .tag{font-size:11.5px;color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);
+    padding:2px 8px;border-radius:20px;}
+  .empty{color:var(--muted);text-align:center;padding:30px;}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);
+    border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px;}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">TT</div>
+    <h1>TikTok Search API</h1>
+    <span class="status"><span class="dot" id="dot"></span><span id="statusText">bağlanılır…</span></span>
+  </header>
+  <div class="sub">Telefonsuz · birbaşa mobil API · imzalar öz-özünə generasiya olunur · tam JSON</div>
+
+  <div class="panel">
+    <div class="tabs" id="tabs">
+      <div class="tab active" data-t="keyword">🎬 Keyword</div>
+      <div class="tab" data-t="hashtag"># Hashtag</div>
+      <div class="tab" data-t="user">👤 User</div>
+      <div class="viewtoggle" id="viewtoggle">
+        <div class="vt active" data-v="cards">Kartlar</div>
+        <div class="vt" data-v="json">JSON</div>
+      </div>
+    </div>
+    <div class="row">
+      <input type="text" id="q" placeholder="Axtarış sözü… (məs: climate change)" value="climate change"/>
+      <button class="go" id="go">Axtar</button>
+    </div>
+    <div class="filters" id="filters">
+      <label>Sıralama
+        <select id="sort_type">
+          <option value="">Uyğunluq (default)</option>
+          <option value="1">Ən çox bəyənilən</option>
+        </select>
+      </label>
+      <label>Vaxt
+        <select id="publish_time">
+          <option value="">İstənilən vaxt</option>
+          <option value="1">Son 24 saat</option>
+          <option value="7">Son həftə</option>
+          <option value="30">Son ay</option>
+          <option value="90">Son 3 ay</option>
+          <option value="180">Son 6 ay</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="meta" id="meta"></div>
+  <div class="grid" id="results"></div>
+</div>
+
+<script>
+const API = "http://localhost:8000";
+let kind = "keyword";
+const $ = s => document.querySelector(s);
+
+document.querySelectorAll(".tab").forEach(t=>{
+  t.onclick = ()=>{
+    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+    t.classList.add("active"); kind = t.dataset.t;
+    $("#q").placeholder = kind==="user" ? "İstifadəçi adı… (məs: nasa)"
+      : kind==="hashtag" ? "Hashtag… (məs: bitcoin)" : "Axtarış sözü… (məs: climate change)";
+    // Filters apply to video searches only.
+    $("#filters").classList.toggle("hidden", kind==="user");
+  };
+});
+
+async function health(){
+  try{
+    const r = await fetch(API+"/health"); const d = await r.json();
+    $("#dot").classList.add("on");
+    $("#statusText").textContent = `${d.device_count} device · ${d.capacity_remaining_today}/${d.total_daily_capacity} sorğu qalıb`;
+  }catch(e){ $("#statusText").textContent = "server oflayn"; }
+}
+function fmt(n){ if(n==null) return "—";
+  if(n>=1e6) return (n/1e6).toFixed(1)+"M"; if(n>=1e3) return (n/1e3).toFixed(1)+"K"; return n; }
+function esc(s){ return (s||"").replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function card(it){
+  if(it.type==="user"){
+    return `<div class="item"><div class="top">
+      <div class="av">${esc((it.username||"?")[0]||"?").toUpperCase()}</div>
+      <span class="uname">@${esc(it.username)}</span>
+      ${it.verified?'<span class="verified">✔ verified</span>':''}</div>
+      <div class="desc">${esc(it.display_name)||""}</div>
+      <div class="stats"><span><b>${fmt(it.follower_count)}</b> follower</span>
+      <span><b>${fmt(it.aweme_count)}</b> video</span>
+      <span>id: ${esc(it.user_id)||"—"}</span></div></div>`;
+  }
+  const tags=(it.hashtags||[]).slice(0,6).map(h=>`<span class="tag">#${esc(h)}</span>`).join("");
+  return `<div class="item"><div class="top">
+    <div class="av">${esc((it.author_username||"?")[0]||"?").toUpperCase()}</div>
+    <span class="uname">@${esc(it.author_username)}</span></div>
+    <div class="desc">${esc(it.description)||"—"}</div>
+    <div class="stats">
+      <span>▶ <b>${fmt(it.view_count)}</b></span>
+      <span>♥ <b>${fmt(it.like_count)}</b></span>
+      <span>💬 <b>${fmt(it.comment_count)}</b></span>
+      <span>↗ <b>${fmt(it.share_count)}</b></span></div>
+    ${tags?`<div class="tags">${tags}</div>`:""}</div>`;
+}
+
+let view = "cards";       // "cards" | "json"
+let lastData = null;      // last /search response, for re-rendering on toggle
+
+function hljson(obj){
+  // JSON.stringify with lightweight syntax highlighting.
+  let j = JSON.stringify(obj, null, 2);
+  j = j.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  j = j.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"(\s*:)?/g,(m,_,colon)=>
+        colon ? '<span class="k">"'+_+'"</span>'+colon : '<span class="s">"'+_+'"</span>')
+       .replace(/\b(-?\d+\.?\d*)\b/g,'<span class="n">$1</span>')
+       .replace(/\b(true|false|null)\b/g,'<span class="b">$1</span>');
+  return j;
+}
+
+function render(){
+  const box = $("#results");
+  if(!lastData){ box.innerHTML=""; return; }
+  if(view==="json"){
+    box.innerHTML = `<pre class="json">${hljson(lastData)}</pre>`;
+  }else{
+    box.innerHTML = lastData.results.length ? lastData.results.map(card).join("")
+      : `<div class="empty">Nəticə tapılmadı — başqa söz sınayın.</div>`;
+  }
+}
+
+document.querySelectorAll(".vt").forEach(v=>{
+  v.onclick = ()=>{
+    document.querySelectorAll(".vt").forEach(x=>x.classList.remove("active"));
+    v.classList.add("active"); view = v.dataset.v; render();
+  };
+});
+
+function buildBody(q){
+  const body = {type:kind, query:q, limit:12};
+  if(kind!=="user"){                 // filters are video-only
+    const st = $("#sort_type").value, pt = $("#publish_time").value;
+    const filters = {};
+    if(st) filters.sort_type = st;
+    if(pt) filters.publish_time = pt;
+    if(Object.keys(filters).length) body.filters = filters;
+  }
+  return body;
+}
+
+async function search(){
+  const q = $("#q").value.trim(); if(!q) return;
+  $("#go").disabled=true; lastData=null; $("#results").innerHTML="";
+  $("#meta").innerHTML = `<span class="spin"></span> axtarılır…`;
+  try{
+    const r = await fetch(API+"/search",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify(buildBody(q))});
+    const d = await r.json();
+    if(!r.ok){ $("#meta").textContent = "Xəta: "+(d.detail||r.status); return; }
+    $("#meta").innerHTML = `<b>${d.count}</b> nəticə · ${d.elapsed_s}s (server) · device <b>${d.device}</b>`;
+    lastData = d; render();
+    health();
+  }catch(e){ $("#meta").textContent = "Server oflayn — api_signed.py işləyirmi?"; }
+  finally{ $("#go").disabled=false; }
+}
+$("#go").onclick = search;
+$("#q").addEventListener("keydown",e=>{ if(e.key==="Enter") search(); });
+health(); setInterval(health, 8000);
+</script>
+</body>
+</html>

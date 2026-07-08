@@ -1,0 +1,7 @@
+requests[socks]
+pycryptodome
+gmssl
+PyYAML
+fastapi
+uvicorn
+pydantic>=2
