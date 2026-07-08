@@ -259,7 +259,3 @@ mobile/
   under `devices:` (must match the signer's app version — see the API reference).
 - **Rate limits:** ~300–500 searches/day per device with an even cadence. Scale
   by adding devices **and** IPs (proxies), not by raising per-device speed.
-- **Signer maintenance:** the vendored signer targets a specific TikTok app
-  version. If TikTok updates its signing SDK, refresh `tiktok_signer/` from
-  upstream ([armxe/tiktok-api](https://github.com/armxe/tiktok-api)) together
-  with the `app_version` / `sdk_version` config fields.
