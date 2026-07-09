@@ -19,6 +19,16 @@ max_results_per_search: 60    # hard ceiling on `limit`
 request_timeout_s: 20         # per HTTP request to TikTok
 retries: 2                    # retry/host-rotate on transient errors
 
+# --- Fan-out (results per search) ------------------------------------
+# TikTok gives each device (esp. synthetic ids) a SHALLOW window (~10 results),
+# then has_more=false. To return more per call we query several devices in
+# parallel and merge+dedupe. default_fan_out is used when a request omits
+# `fan_out`. Each unit spends ONE device's daily budget.
+#   fan_out ~6  -> reliably 30+ merged results (the efficient sweet spot)
+#   fan_out ~15 -> ~50, with diminishing returns and higher budget cost
+# Real device ids return hundreds each, so drop this to 1 once you have them.
+default_fan_out: 6
+
 # --- DEVICES ----------------------------------------------------------
 # The pool balances /search across all devices (least-recently-used with budget
 # left). Two ways to add devices, combinable:
@@ -31,7 +41,7 @@ retries: 2                    # retry/host-rotate on transient errors
 #                       for steady use.
 #
 # For now (testing): 5 synthetic devices so you can exercise balancing.
-synthetic_devices: 5
+synthetic_devices: 10
 
 devices: []
 

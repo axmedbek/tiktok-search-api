@@ -43,6 +43,7 @@ class SearchQuery:
     kind: SearchKind
     term: str
     limit: int = 30
+    cursor: int = 0
     filters: SearchFilters = field(default_factory=SearchFilters)
 
     def __post_init__(self) -> None:
@@ -50,6 +51,8 @@ class SearchQuery:
             raise ValueError('search term must be non-empty')
         if self.limit < 1:
             raise ValueError('limit must be >= 1')
+        if self.cursor < 0:
+            raise ValueError('cursor must be >= 0')
         if self.kind is SearchKind.USER and (not self.filters.is_empty()):
             raise ValueError('filters are not supported for user search')
         object.__setattr__(self, 'term', self.term.strip())
@@ -67,3 +70,10 @@ class SearchQuery:
         if self.kind is SearchKind.USER:
             return f'user:{self.term}'
         return f'search:{self.term}'
+
+@dataclass(frozen=True, slots=True)
+class SearchPage:
+    records: list[dict]
+    cursor: int
+    next_cursor: int | None
+    has_more: bool

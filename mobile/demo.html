@@ -208,8 +208,11 @@ document.querySelectorAll(".vt").forEach(v=>{
   };
 });
 
-function buildBody(q){
-  const body = {type:kind, query:q, limit:12};
+let cursor = 0;           // pagination cursor for the current query
+let accResults = [];      // accumulated results across pages
+
+function buildBody(q, cur){
+  const body = {type:kind, query:q, limit:50, cursor:cur||0};
   if(kind!=="user"){                 // filters are video-only
     const st = $("#sort_type").value, pt = $("#publish_time").value;
     const filters = {};
@@ -220,21 +223,49 @@ function buildBody(q){
   return body;
 }
 
+function renderMeta(d){
+  const more = d.has_more ? ` · <a href="#" id="more">daha çox ↓</a>` : "";
+  $("#meta").innerHTML =
+    `<b>${accResults.length}</b> nəticə · ${d.elapsed_s}s · device <b>${d.device}</b>`
+    + ` · cursor ${d.cursor}→${d.next_cursor==null?"—":d.next_cursor}${more}`;
+  const m = $("#more");
+  if(m) m.onclick = e => { e.preventDefault(); loadMore(); };
+}
+
+async function fetchPage(q, cur){
+  const r = await fetch(API+"/search",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify(buildBody(q, cur))});
+  const d = await r.json();
+  if(!r.ok) throw new Error(d.detail||r.status);
+  return d;
+}
+
 async function search(){
   const q = $("#q").value.trim(); if(!q) return;
-  $("#go").disabled=true; lastData=null; $("#results").innerHTML="";
-  $("#meta").innerHTML = `<span class="spin"></span> axtarılır…`;
+  $("#go").disabled=true; lastData=null; accResults=[]; cursor=0;
+  $("#results").innerHTML=""; $("#meta").innerHTML = `<span class="spin"></span> axtarılır…`;
   try{
-    const r = await fetch(API+"/search",{method:"POST",headers:{"content-type":"application/json"},
-      body:JSON.stringify(buildBody(q))});
-    const d = await r.json();
-    if(!r.ok){ $("#meta").textContent = "Xəta: "+(d.detail||r.status); return; }
-    $("#meta").innerHTML = `<b>${d.count}</b> nəticə · ${d.elapsed_s}s (server) · device <b>${d.device}</b>`;
-    lastData = d; render();
-    health();
-  }catch(e){ $("#meta").textContent = "Server oflayn — api_signed.py işləyirmi?"; }
+    const d = await fetchPage(q, 0);
+    accResults = d.results.slice();
+    cursor = d.next_cursor;
+    lastData = {...d, results: accResults};
+    render(); renderMeta(d); health();
+  }catch(e){ $("#meta").textContent = "Xəta / server oflayn: "+e.message; }
   finally{ $("#go").disabled=false; }
 }
+
+async function loadMore(){
+  const q = $("#q").value.trim(); if(!q || cursor==null) return;
+  $("#meta").innerHTML += ` <span class="spin"></span>`;
+  try{
+    const d = await fetchPage(q, cursor);
+    accResults = accResults.concat(d.results);
+    cursor = d.next_cursor;
+    lastData = {...d, results: accResults};
+    render(); renderMeta(d); health();
+  }catch(e){ $("#meta").textContent = "Xəta: "+e.message; }
+}
+
 $("#go").onclick = search;
 $("#q").addEventListener("keydown",e=>{ if(e.key==="Enter") search(); });
 health(); setInterval(health, 8000);

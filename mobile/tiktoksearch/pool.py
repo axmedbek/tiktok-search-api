@@ -1,12 +1,15 @@
 from __future__ import annotations
 import logging
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Optional
 from .client import TikTokClient
 from .config import PoolConfig
 from .errors import PoolExhausted
-from .filters import SearchQuery
+from .filters import SearchPage, SearchQuery
 logger = logging.getLogger('tiktoksearch.pool')
 
 def _utc_day() -> str:
@@ -101,7 +104,6 @@ class ClientPool:
         return sum((s.daily_cap for s in self._slots))
 
     def acquire(self) -> DeviceSlot:
-        import time
         deadline = time.monotonic() + self._config.acquire_timeout_s
         with self._cond:
             while True:
@@ -127,12 +129,46 @@ class ClientPool:
                 slot.inflight.release()
             self._cond.notify_all()
 
-    def run(self, query: SearchQuery) -> tuple[str, list[dict]]:
+    def run(self, query: SearchQuery) -> tuple[str, SearchPage]:
         slot = self.acquire()
         try:
             return (slot.label, slot.client.search(query))
         finally:
             self.release(slot)
+
+    def run_merged(self, query: SearchQuery, fan_out: int) -> tuple[list[str], SearchPage]:
+        fan_out = max(1, min(fan_out, len(self._slots)))
+        if fan_out == 1:
+            device, page = self.run(query)
+            return ([device], page)
+
+        def one(_: int) -> tuple[str, SearchPage] | None:
+            try:
+                return self.run(query)
+            except PoolExhausted:
+                return None
+
+        with ThreadPoolExecutor(max_workers=fan_out) as pool:
+            outcomes = list(pool.map(one, range(fan_out)))
+
+        pages = [o for o in outcomes if o is not None]
+        if not pages:
+            raise PoolExhausted('Daily request cap reached on all devices.')
+
+        merged: list[dict] = []
+        seen: set[str] = set()
+        has_more = False
+        for _, page in pages:
+            has_more = has_more or page.has_more
+            for record in page.records:
+                key = record.get('id') or record.get('username')
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(record)
+        devices = [device for device, _ in pages]
+        merged = merged[:query.limit]
+        return (devices, SearchPage(records=merged, cursor=query.cursor, next_cursor=query.cursor + len(merged) if has_more else None, has_more=has_more))
 
     def status(self) -> dict:
         slots = [s.status() for s in self._slots]

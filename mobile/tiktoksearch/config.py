@@ -47,6 +47,7 @@ class PoolConfig:
     daily_request_cap_per_device: int = 300
     acquire_timeout_s: float = 60.0
     max_results_per_search: int = 60
+    default_fan_out: int = 1
     proxies: tuple[str, ...] = ()
     devices: tuple[Mapping[str, Any], ...] = ()
     synthetic_devices: int = 0
@@ -54,7 +55,7 @@ class PoolConfig:
 
     @classmethod
     def from_mapping(cls, cfg: Mapping[str, Any]) -> 'PoolConfig':
-        return cls(daily_request_cap_per_device=int(cfg.get('daily_request_cap_per_device', 300)), acquire_timeout_s=float(cfg.get('acquire_timeout_s', 60)), max_results_per_search=int(cfg.get('max_results_per_search', 60)), proxies=tuple((p for p in cfg.get('proxies') or [] if p)), devices=tuple(cfg.get('devices') or ()), synthetic_devices=int(cfg.get('synthetic_devices', 0)), client_defaults=ClientConfig.from_mapping(cfg))
+        return cls(daily_request_cap_per_device=int(cfg.get('daily_request_cap_per_device', 300)), acquire_timeout_s=float(cfg.get('acquire_timeout_s', 60)), max_results_per_search=int(cfg.get('max_results_per_search', 60)), default_fan_out=int(cfg.get('default_fan_out', 1)), proxies=tuple((p for p in cfg.get('proxies') or [] if p)), devices=tuple(cfg.get('devices') or ()), synthetic_devices=int(cfg.get('synthetic_devices', 0)), client_defaults=ClientConfig.from_mapping(cfg))
 
     @classmethod
     def load_yaml(cls, path: str | os.PathLike[str]) -> 'PoolConfig':

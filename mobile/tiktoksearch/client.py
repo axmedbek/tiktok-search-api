@@ -7,7 +7,7 @@ from typing import Callable, Optional
 import requests
 from .config import ClientConfig
 from .errors import RateLimited, SoftError, TransportError
-from .filters import SearchKind, SearchQuery
+from .filters import SearchKind, SearchPage, SearchQuery
 from .mapping import flatten_user, flatten_video
 from .signing import MetasecSigner
 logger = logging.getLogger('tiktoksearch.client')
@@ -31,37 +31,38 @@ class TikTokClient:
         if config.proxy:
             self._session.proxies = {'http': config.proxy, 'https': config.proxy}
 
-    def search(self, query: SearchQuery) -> list[dict]:
+    def search(self, query: SearchQuery) -> SearchPage:
         if query.kind is SearchKind.USER:
             return self._search_users(query)
         return self._search_videos(query)
 
-    def _search_videos(self, query: SearchQuery) -> list[dict]:
+    def _search_videos(self, query: SearchQuery) -> SearchPage:
         filter_params = query.filters.to_query_params()
 
         def build(offset: int, count: int) -> dict:
             params = {'keyword': query.keyword, 'count': str(count), 'offset': str(offset), 'search_source': 'normal_search'}
             params.update(filter_params)
             return params
-        return self._paginate(path=SEARCH_VIDEO_PATH, build_params=build, items_key='data', unwrap=lambda item: item.get('aweme_info') or item.get('aweme') or (item if item.get('aweme_id') else None), flatten=flatten_video, cursor_key='cursor', source_term=query.source_term, limit=query.limit)
+        return self._paginate(path=SEARCH_VIDEO_PATH, build_params=build, items_key='data', unwrap=lambda item: item.get('aweme_info') or item.get('aweme') or (item if item.get('aweme_id') else None), flatten=flatten_video, source_term=query.source_term, limit=query.limit, start_cursor=query.cursor)
 
-    def _search_users(self, query: SearchQuery) -> list[dict]:
+    def _search_users(self, query: SearchQuery) -> SearchPage:
 
         def build(offset: int, count: int) -> dict:
             return {'keyword': query.term, 'count': str(count), 'cursor': str(offset), 'type': '1', 'search_source': 'normal_search'}
-        return self._paginate(path=SEARCH_USER_PATH, build_params=build, items_key='user_list', unwrap=lambda item: item.get('user_info') or item, flatten=flatten_user, cursor_key='cursor', source_term=query.source_term, limit=query.limit)
+        return self._paginate(path=SEARCH_USER_PATH, build_params=build, items_key='user_list', unwrap=lambda item: item.get('user_info') or item, flatten=flatten_user, source_term=query.source_term, limit=query.limit, start_cursor=query.cursor)
 
-    def _paginate(self, *, path: str, build_params: Callable[[int, int], dict], items_key: str, unwrap: Callable[[dict], Optional[dict]], flatten: Callable[[dict, str], Optional[dict]], cursor_key: str, source_term: str, limit: int) -> list[dict]:
+    def _paginate(self, *, path: str, build_params: Callable[[int, int], dict], items_key: str, unwrap: Callable[[dict], Optional[dict]], flatten: Callable[[dict, str], Optional[dict]], source_term: str, limit: int, start_cursor: int) -> SearchPage:
         out: list[dict] = []
         seen: set[str] = set()
-        offset = 0
+        cursor = start_cursor
+        has_more = False
         while len(out) < limit:
             params = self._common_params()
-            params.update(build_params(offset, min(20, limit - len(out))))
+            params.update(build_params(cursor, min(20, limit - len(out))))
             data = self._get_signed(path, params)
             raw_items = data.get(items_key) or []
-            if not raw_items:
-                break
+            next_cursor = data.get('cursor', cursor + len(raw_items))
+            has_more = bool(data.get('has_more'))
             for raw in raw_items:
                 node = unwrap(raw)
                 if node is None:
@@ -74,10 +75,10 @@ class TikTokClient:
                 out.append(record)
                 if len(out) >= limit:
                     break
-            if not data.get('has_more'):
+            cursor = next_cursor
+            if not has_more or not raw_items:
                 break
-            offset = data.get(cursor_key, offset + len(raw_items))
-        return out
+        return SearchPage(records=out, cursor=start_cursor, next_cursor=cursor if has_more else None, has_more=has_more)
 
     def _common_params(self) -> dict:
         cfg = self._config

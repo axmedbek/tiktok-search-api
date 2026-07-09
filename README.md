@@ -85,6 +85,43 @@ curl -X POST localhost:8000/search \
 - `sort_type`: `"0"` relevance (default) · `"1"` most liked
 - `publish_time`: `"0"` all · `"1"` 24h · `"7"` week · `"30"` month · `"90"` 3 months · `"180"` 6 months
 
+### Pagination
+
+Every response returns `next_cursor` and `has_more`. Start with `cursor: 0`
+(or omit it), then resend with `cursor` set to the previous `next_cursor`:
+
+```bash
+# page 1
+curl -X POST localhost:8000/search -H 'content-type: application/json' \
+  -d '{ "type": "keyword", "query": "cats", "limit": 20 }'          # -> next_cursor: 20
+
+# page 2
+curl -X POST localhost:8000/search -H 'content-type: application/json' \
+  -d '{ "type": "keyword", "query": "cats", "limit": 20, "cursor": 20 }'
+```
+
+Stop when `has_more` is `false`. (How deep paging goes depends on the device
+identity — synthetic ids get a shallow window; real device ids + proxies unlock
+more, with no code change. See the API reference.)
+
+### Results per search (fan-out)
+
+TikTok gives each synthetic device only ~10 results per call. To return more, the
+API queries several devices in parallel and merges/dedupes them — a plain request
+already returns **~30+** (server `default_fan_out: 6`). Override per request:
+
+```bash
+# ~30+ results (default) — no extra params needed
+curl -X POST localhost:8000/search -d '{"type":"keyword","query":"cats","limit":60}'
+
+# cheapest, single device (~10)
+curl -X POST localhost:8000/search -d '{"type":"keyword","query":"cats","fan_out":1}'
+```
+
+Each `fan_out` unit spends one device's daily budget. Returns diminish past ~6
+(popular queries repeat across devices). Real device ids return hundreds each —
+then set `default_fan_out: 1`.
+
 ### Hashtag search (the `#` is optional)
 
 ```bash
@@ -109,6 +146,9 @@ curl -X POST localhost:8000/search \
   "type": "keyword",
   "device": "syn0",
   "count": 18,
+  "cursor": 0,
+  "next_cursor": 20,
+  "has_more": true,
   "elapsed_s": 2.4,
   "results": [
     {
@@ -169,8 +209,10 @@ query = SearchQuery(
     ),
 )
 
-for record in client.search(query):
+page = client.search(query)                    # -> SearchPage
+for record in page.records:
     print(record["author_username"], record["like_count"], record["view_count"])
+print("next_cursor:", page.next_cursor, "has_more:", page.has_more)
 ```
 
 For a load-balanced fleet, use the pool:
@@ -179,8 +221,8 @@ For a load-balanced fleet, use the pool:
 from tiktoksearch import ClientPool, PoolConfig, SearchQuery, SearchKind
 
 pool = ClientPool(PoolConfig.load_yaml("mobile/config_signed.yaml"))
-device, results = pool.run(SearchQuery(kind=SearchKind.USER, term="nasa", limit=10))
-print(f"served by {device}: {len(results)} users")
+device, page = pool.run(SearchQuery(kind=SearchKind.USER, term="nasa", limit=10))
+print(f"served by {device}: {len(page.records)} users")
 ```
 
 ---

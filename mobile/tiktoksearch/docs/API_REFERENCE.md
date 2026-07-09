@@ -51,16 +51,21 @@ Use as a library (no HTTP):
 
 ```python
 import sys; sys.path.insert(0, "mobile")
+from dataclasses import replace
 from tiktoksearch import TikTokClient, ClientConfig, SearchQuery, SearchKind, \
     SearchFilters, SortType, PublishTime
 
 client = TikTokClient(ClientConfig())          # synthesizes a device id
 query = SearchQuery(
-    kind=SearchKind.KEYWORD, term="climate change", limit=20,
+    kind=SearchKind.KEYWORD, term="climate change", limit=20, cursor=0,
     filters=SearchFilters(sort_type=SortType.MOST_LIKED,
                           publish_time=PublishTime.LAST_MONTH),
 )
-results = client.search(query)
+page = client.search(query)          # -> SearchPage
+records = page.records               # list[dict]
+# next page:
+if page.has_more:
+    next_page = client.search(replace(query, cursor=page.next_cursor))
 ```
 
 ---
@@ -75,8 +80,27 @@ Run a keyword, hashtag, or user search.
 |-----------|---------|-----|---------|-------|
 | `type`    | enum    | ✓   | —       | `keyword` \| `hashtag` \| `user` |
 | `query`   | string  | ✓   | —       | 1–200 chars. For `hashtag`, the `#` is optional. |
-| `limit`   | int     |     | `30`    | 1–200; capped by `max_results_per_search` (default 60). |
+| `limit`   | int     |     | `30`    | Max results **per page**; 1–200, capped by `max_results_per_search` (default 60). |
+| `cursor`  | int     |     | `0`     | Pagination offset. Pass a prior response's `next_cursor` to fetch the next page; start at `0`. |
+| `fan_out` | int     |     | server  | Query N devices in parallel and merge+dedupe. Omit to use the server `default_fan_out` (6 → ~30+ results). `1` = one device (~10, cheapest). Each unit spends one device's daily budget. |
 | `filters` | object  |     | `null`  | Video searches only (`keyword`/`hashtag`). See below. |
+
+### Results per search (fan-out)
+
+TikTok gives each device — especially synthetic ids — a **shallow window** (~10
+results, then `has_more=false`). To return more per call, the API queries several
+devices in parallel and **merges + dedupes** their results. This is controlled by
+`fan_out` (per request) or `default_fan_out` (server config, default `6`).
+
+| `fan_out` | Typical merged results | Budget cost |
+|---|---|---|
+| `1` | ~10 | 1 device |
+| `6` (default) | **~30–40** | 6 devices |
+| `15` | ~50 | 15 devices (diminishing returns) |
+
+A plain request (no `fan_out`) already returns ~30+. Returns diminish past ~6
+because popular queries surface the same top results across devices. **Real
+device ids return hundreds each** — with them, set `default_fan_out: 1`.
 
 ### Filters (video searches only)
 
@@ -113,7 +137,35 @@ curl -X POST localhost:8000/search -H 'content-type: application/json' \
 # user
 curl -X POST localhost:8000/search -H 'content-type: application/json' \
   -d '{ "type": "user", "query": "nasa", "limit": 10 }'
+
+# page 2: pass the previous response's next_cursor
+curl -X POST localhost:8000/search -H 'content-type: application/json' \
+  -d '{ "type": "keyword", "query": "climate change", "limit": 20, "cursor": 20 }'
 ```
+
+### Pagination
+
+Responses are cursor-paged. Start with `cursor: 0` (or omit it); each response
+returns `next_cursor` and `has_more`. To fetch the next page, resend the same
+request with `cursor` set to the previous `next_cursor`. Stop when
+`has_more` is `false` (then `next_cursor` is `null`).
+
+```python
+cursor, all_results = 0, []
+while True:
+    r = requests.post(url, json={"type": "keyword", "query": "cats",
+                                 "limit": 20, "cursor": cursor}).json()
+    all_results += r["results"]
+    if not r["has_more"]:
+        break
+    cursor = r["next_cursor"]
+```
+
+> **Depth note.** How deep pagination goes depends on the device identity.
+> Synthetic ids typically get a shallow window (TikTok's anti-scrape guard) — the
+> API returns the correct `next_cursor`/`has_more`, but a follow-up page may come
+> back empty. Real, warmed device ids (and per-device proxies) unlock deeper
+> paging automatically, with no code change.
 
 ### Response
 
@@ -123,6 +175,9 @@ curl -X POST localhost:8000/search -H 'content-type: application/json' \
   "type": "keyword",
   "device": "syn0",          // which pool device served it
   "count": 18,
+  "cursor": 0,               // the cursor this page started from
+  "next_cursor": 20,         // pass as `cursor` for the next page (null when done)
+  "has_more": true,          // more results available?
   "elapsed_s": 2.4,
   "results": [ /* video or user records */ ]
 }

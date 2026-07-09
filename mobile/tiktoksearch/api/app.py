@@ -16,7 +16,7 @@ DEFAULT_CONFIG_PATH = 'config_signed.yaml'
 def _to_query(req: SearchRequest, max_results: int) -> SearchQuery:
     filters = SearchFilters(sort_type=req.filters.sort_type if req.filters else None, publish_time=req.filters.publish_time if req.filters else None)
     try:
-        return SearchQuery(kind=req.type, term=req.query, limit=min(req.limit, max_results), filters=filters)
+        return SearchQuery(kind=req.type, term=req.query, limit=min(req.limit, max_results), cursor=req.cursor, filters=filters)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -42,8 +42,13 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
         query = _to_query(req, config.max_results_per_search)
         started = time.monotonic()
         loop = asyncio.get_running_loop()
+        fan_out = req.fan_out if req.fan_out is not None else config.default_fan_out
         try:
-            device, results = await loop.run_in_executor(None, pool.run, query)
+            if fan_out > 1:
+                devices, page = await loop.run_in_executor(None, pool.run_merged, query, fan_out)
+                device = '+'.join(devices)
+            else:
+                device, page = await loop.run_in_executor(None, pool.run, query)
         except PoolExhausted as exc:
             code = 429 if 'cap reached' in exc.reason else 503
             raise HTTPException(status_code=code, detail=exc.reason) from exc
@@ -51,7 +56,7 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
             raise HTTPException(status_code=429, detail='TikTok rate-limited the request — slow down or add proxies.') from exc
         except (SoftError, TransportError) as exc:
             raise HTTPException(status_code=502, detail=f'TikTok request failed: {exc}') from exc
-        return SearchResponse(query=query.term, type=req.type, device=device, count=len(results), elapsed_s=round(time.monotonic() - started, 2), results=results)
+        return SearchResponse(query=query.term, type=req.type, device=device, count=len(page.records), cursor=page.cursor, next_cursor=page.next_cursor, has_more=page.has_more, elapsed_s=round(time.monotonic() - started, 2), results=page.records)
 
     @app.get('/health', response_model=HealthResponse, tags=['ops'])
     async def health(pool: ClientPool=Depends(get_pool)) -> HealthResponse:
