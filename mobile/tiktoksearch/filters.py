@@ -31,12 +31,22 @@ class SearchFilters:
     def to_query_params(self) -> dict[str, str]:
         if self.is_empty():
             return {}
+        # Real TikTok v46 reads filters as FLAT params (publish_time / sort_type /
+        # general_filter_sort_type), NOT a filter_selected JSON blob (that was the
+        # old v32 scheme and is ignored by v46 → unfiltered results). We emit the
+        # flat params (what the app really sends) plus the legacy blob for the old
+        # synthetic path's backward compatibility.
+        params: dict[str, str] = {'is_filter_search': '1', 'filter_by': '0'}
         selected = {'filter_by': '0'}
         if self.sort_type is not None:
+            params['sort_type'] = self.sort_type.value
+            params['general_filter_sort_type'] = self.sort_type.value
             selected['sort_type'] = self.sort_type.value
         if self.publish_time is not None:
+            params['publish_time'] = self.publish_time.value
             selected['publish_time'] = self.publish_time.value
-        return {'filter_selected': json.dumps(selected, separators=(',', ':')), 'is_filter_search': '1'}
+        params['filter_selected'] = json.dumps(selected, separators=(',', ':'))
+        return params
 
 @dataclass(frozen=True, slots=True)
 class SearchQuery:

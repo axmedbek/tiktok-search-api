@@ -6,76 +6,153 @@
 <title>TikTok Search API — Demo</title>
 <style>
   :root{
-    --bg:#0b0d10; --card:#15181d; --card2:#1b1f26; --line:#272c34;
-    --txt:#e8eaed; --muted:#9aa3ad; --accent:#25f4ee; --accent2:#fe2c55;
-    --ok:#3ddc84;
+    --bg:#0a0b0e; --bg2:#10131a; --card:#14181f; --card2:#1a1f28; --line:#262c37;
+    --txt:#eef1f5; --muted:#8b95a3; --faint:#5a6472;
+    --accent:#25f4ee; --accent2:#fe2c55; --pink:#ff4d78;
+    --ok:#3ddc84; --warn:#ffb638; --err:#ff5c6c;
+    --shadow:0 8px 30px rgba(0,0,0,.35);
   }
   @media (prefers-color-scheme: light){
-    :root{ --bg:#f4f6f8; --card:#fff; --card2:#f0f2f5; --line:#e2e6ea;
-      --txt:#14181d; --muted:#5b6570; --accent:#0aa; --accent2:#fe2c55; --ok:#128a4a; }
+    :root{ --bg:#eef1f5; --bg2:#e4e9ef; --card:#fff; --card2:#f3f6f9; --line:#e0e5ec;
+      --txt:#121722; --muted:#5b6673; --faint:#93a0af;
+      --accent:#00b3ab; --accent2:#fe2c55; --pink:#e02350; --ok:#128a4a;
+      --shadow:0 8px 28px rgba(30,50,80,.10); }
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--txt);
-    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
-  .wrap{max-width:920px;margin:0 auto;padding:28px 18px 60px;}
-  header{display:flex;align-items:center;gap:12px;margin-bottom:6px;}
-  h1{font-size:22px;margin:0;font-weight:700;letter-spacing:-.3px;}
-  .logo{width:34px;height:34px;border-radius:9px;
+  html,body{margin:0}
+  body{background:
+      radial-gradient(1100px 500px at 85% -8%, color-mix(in srgb,var(--accent) 12%,transparent), transparent 60%),
+      radial-gradient(900px 460px at 10% -6%, color-mix(in srgb,var(--accent2) 12%,transparent), transparent 60%),
+      var(--bg);
+    color:var(--txt);min-height:100vh;
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;}
+  .wrap{max-width:1000px;margin:0 auto;padding:30px 18px 70px;}
+
+  /* header */
+  header{display:flex;align-items:center;gap:13px;margin-bottom:4px;flex-wrap:wrap;}
+  .logo{width:40px;height:40px;border-radius:11px;
     background:linear-gradient(135deg,var(--accent2),var(--accent));
-    display:grid;place-items:center;font-weight:800;color:#fff;}
-  .sub{color:var(--muted);margin:2px 0 22px;font-size:13.5px;}
-  .status{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;
+    display:grid;place-items:center;font-weight:800;color:#fff;font-size:17px;
+    box-shadow:0 4px 14px color-mix(in srgb,var(--accent2) 40%,transparent);}
+  h1{font-size:23px;margin:0;font-weight:800;letter-spacing:-.4px;}
+  .status{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;
     color:var(--muted);background:var(--card);border:1px solid var(--line);
-    padding:5px 11px;border-radius:20px;margin-left:auto;}
-  .dot{width:8px;height:8px;border-radius:50%;background:#888;}
-  .dot.on{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent);}
-  .panel{background:var(--card);border:1px solid var(--line);border-radius:16px;
-    padding:16px;margin-bottom:20px;}
-  .tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;}
-  .tab{padding:8px 15px;border-radius:10px;border:1px solid var(--line);
-    background:var(--card2);color:var(--muted);cursor:pointer;font-weight:600;font-size:13.5px;}
-  .tab.active{background:var(--txt);color:var(--bg);border-color:var(--txt);}
+    padding:6px 13px;border-radius:22px;margin-left:auto;box-shadow:var(--shadow);white-space:nowrap;}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--faint);transition:.3s;}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 22%,transparent);}
+  .dot.off{background:var(--err);box-shadow:0 0 0 4px color-mix(in srgb,var(--err) 22%,transparent);}
+  .sub{color:var(--muted);margin:8px 0 24px;font-size:13.5px;}
+  .sub b{color:var(--txt);font-weight:700;}
+  .pill{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.4px;
+    text-transform:uppercase;color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 13%,transparent);
+    border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);
+    padding:2px 8px;border-radius:6px;vertical-align:1px;margin-right:6px;}
+
+  /* search panel */
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:18px;
+    padding:18px;margin-bottom:18px;box-shadow:var(--shadow);}
+  .tabs{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap;align-items:center;}
+  .tab{padding:9px 16px;border-radius:11px;border:1px solid var(--line);
+    background:var(--card2);color:var(--muted);cursor:pointer;font-weight:600;font-size:13.5px;
+    transition:.15s;}
+  .tab:hover{color:var(--txt);}
+  .tab.active{background:linear-gradient(135deg,var(--accent2),var(--pink));color:#fff;
+    border-color:transparent;box-shadow:0 3px 12px color-mix(in srgb,var(--accent2) 35%,transparent);}
   .viewtoggle{margin-left:auto;display:flex;gap:3px;background:var(--card2);
-    border:1px solid var(--line);border-radius:10px;padding:3px;}
-  .vt{padding:5px 12px;border-radius:8px;cursor:pointer;color:var(--muted);
-    font-weight:600;font-size:12.5px;}
-  .vt.active{background:var(--accent);color:#001;}
-  .filters{display:flex;gap:14px;margin-top:12px;flex-wrap:wrap;}
-  .filters label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted);font-weight:600;}
-  .filters select{padding:8px 10px;border-radius:9px;border:1px solid var(--line);
-    background:var(--bg);color:var(--txt);font-size:13.5px;outline:none;cursor:pointer;}
+    border:1px solid var(--line);border-radius:11px;padding:3px;}
+  .vt{padding:6px 13px;border-radius:8px;cursor:pointer;color:var(--muted);
+    font-weight:600;font-size:12.5px;transition:.15s;}
+  .vt.active{background:var(--accent);color:#00201f;}
+  .row{display:flex;gap:10px;}
+  input[type=text]{flex:1;padding:14px 16px;border-radius:12px;border:1px solid var(--line);
+    background:var(--bg2);color:var(--txt);font-size:15px;outline:none;transition:.15s;}
+  input[type=text]:focus{border-color:var(--accent);
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent);}
+  button.go{padding:0 26px;border:0;border-radius:12px;font-weight:800;font-size:14.5px;
+    cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--accent2),var(--pink));
+    box-shadow:0 4px 14px color-mix(in srgb,var(--accent2) 32%,transparent);transition:.15s;}
+  button.go:hover:not(:disabled){transform:translateY(-1px);}
+  button.go:disabled{opacity:.45;cursor:default;}
+  .filters{display:flex;gap:14px;margin-top:14px;flex-wrap:wrap;}
+  .filters label{display:flex;flex-direction:column;gap:5px;font-size:11.5px;color:var(--muted);
+    font-weight:700;text-transform:uppercase;letter-spacing:.3px;}
+  .filters select{padding:9px 11px;border-radius:10px;border:1px solid var(--line);
+    background:var(--bg2);color:var(--txt);font-size:13.5px;outline:none;cursor:pointer;}
   .filters select:focus{border-color:var(--accent);}
   .filters.hidden{display:none;}
-  pre.json{background:var(--card);border:1px solid var(--line);border-radius:14px;
-    padding:16px;overflow-x:auto;font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
-    color:var(--txt);white-space:pre;margin:0;}
+
+  /* banner (errors / notices) */
+  .banner{border-radius:13px;padding:13px 16px;margin-bottom:16px;font-size:13.5px;
+    display:none;align-items:flex-start;gap:10px;line-height:1.45;}
+  .banner.show{display:flex;}
+  .banner .bi{font-size:16px;line-height:1.2;}
+  .banner.err{background:color-mix(in srgb,var(--err) 12%,transparent);
+    border:1px solid color-mix(in srgb,var(--err) 35%,transparent);color:var(--txt);}
+  .banner.warn{background:color-mix(in srgb,var(--warn) 12%,transparent);
+    border:1px solid color-mix(in srgb,var(--warn) 35%,transparent);color:var(--txt);}
+  .banner b{font-weight:700;} .banner a{color:var(--accent);}
+
+  /* meta bar */
+  .meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    color:var(--muted);font-size:12.5px;margin:6px 2px 14px;min-height:18px;}
+  .chip{display:inline-flex;align-items:center;gap:5px;background:var(--card);
+    border:1px solid var(--line);border-radius:20px;padding:4px 11px;font-weight:600;}
+  .chip b{color:var(--txt);}
+  .chip .mono{font:11.5px ui-monospace,Menlo,monospace;color:var(--accent);}
+
+  /* results grid */
+  .grid{display:grid;gap:13px;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));}
+  .grid.json-mode{grid-template-columns:1fr;}
+  .item{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:15px 17px;
+    box-shadow:var(--shadow);transition:.15s;position:relative;overflow:hidden;}
+  .item:hover{border-color:color-mix(in srgb,var(--accent) 40%,transparent);transform:translateY(-2px);}
+  .item .top{display:flex;align-items:center;gap:10px;margin-bottom:9px;}
+  .av{width:34px;height:34px;border-radius:50%;flex:none;
+    background:linear-gradient(135deg,var(--accent2),var(--accent));
+    display:grid;place-items:center;font-weight:800;color:#fff;font-size:14px;}
+  .uname{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .verified{color:var(--accent);font-size:12px;flex:none;}
+  .region{margin-left:auto;font-size:11px;color:var(--faint);border:1px solid var(--line);
+    border-radius:6px;padding:1px 6px;flex:none;}
+  .desc{color:var(--txt);margin:2px 0 11px;font-size:14px;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
+  .stats{display:flex;flex-wrap:wrap;gap:13px;color:var(--muted);font-size:12.5px;}
+  .stats span{display:inline-flex;align-items:center;gap:4px;}
+  .stats b{color:var(--txt);font-weight:700;}
+  .subline{display:flex;flex-wrap:wrap;gap:10px;margin-top:9px;
+    color:var(--faint);font-size:11.5px;}
+  .subline span{display:inline-flex;align-items:center;gap:4px;}
+  .tags{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;}
+  .tag{font-size:11.5px;color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 12%,transparent);padding:2px 9px;border-radius:20px;}
+  .id{position:absolute;top:11px;right:13px;font:10px ui-monospace,Menlo,monospace;
+    color:var(--faint);opacity:.7;}
+
+  .empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:44px 20px;
+    background:var(--card);border:1px dashed var(--line);border-radius:15px;}
+  .empty .big{font-size:30px;margin-bottom:8px;}
+
+  pre.json{grid-column:1/-1;background:var(--card);border:1px solid var(--line);border-radius:15px;
+    padding:18px;overflow-x:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:var(--txt);white-space:pre;margin:0;box-shadow:var(--shadow);}
   .json .k{color:var(--accent2);} .json .s{color:var(--ok);}
   .json .n{color:var(--accent);} .json .b{color:#c792ea;}
-  .row{display:flex;gap:10px;}
-  input[type=text]{flex:1;padding:13px 15px;border-radius:11px;border:1px solid var(--line);
-    background:var(--bg);color:var(--txt);font-size:15px;outline:none;}
-  input[type=text]:focus{border-color:var(--accent);}
-  button.go{padding:0 22px;border:0;border-radius:11px;font-weight:700;font-size:14.5px;
-    cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--accent2),#ff5c78);}
-  button.go:disabled{opacity:.5;cursor:default;}
-  .meta{color:var(--muted);font-size:12.5px;margin:14px 2px 10px;min-height:16px;}
-  .grid{display:grid;gap:12px;}
-  .item{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;}
-  .item .top{display:flex;align-items:center;gap:9px;margin-bottom:8px;}
-  .av{width:30px;height:30px;border-radius:50%;background:var(--card2);
-    display:grid;place-items:center;font-weight:700;color:var(--accent);font-size:13px;}
-  .uname{font-weight:700;}
-  .verified{color:var(--accent);font-size:12px;}
-  .desc{color:var(--txt);margin:2px 0 10px;font-size:14px;}
-  .stats{display:flex;flex-wrap:wrap;gap:14px;color:var(--muted);font-size:12.5px;}
-  .stats b{color:var(--txt);font-weight:700;}
-  .tags{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px;}
-  .tag{font-size:11.5px;color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);
-    padding:2px 8px;border-radius:20px;}
-  .empty{color:var(--muted);text-align:center;padding:30px;}
+
+  /* load more */
+  .morebar{grid-column:1/-1;display:flex;justify-content:center;padding:6px 0 2px;}
+  button.more{padding:11px 26px;border:1px solid var(--line);border-radius:12px;
+    background:var(--card2);color:var(--txt);font-weight:700;font-size:13.5px;cursor:pointer;transition:.15s;}
+  button.more:hover:not(:disabled){border-color:var(--accent);color:var(--accent);}
+  button.more:disabled{opacity:.5;cursor:default;}
+
   .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);
     border-top-color:transparent;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px;}
   @keyframes s{to{transform:rotate(360deg)}}
+
+  footer{margin-top:34px;text-align:center;color:var(--faint);font-size:11.5px;line-height:1.7;}
+  footer code{background:var(--card2);border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+    font:11px ui-monospace,Menlo,monospace;color:var(--muted);}
 </style>
 </head>
 <body>
@@ -85,7 +162,11 @@
     <h1>TikTok Search API</h1>
     <span class="status"><span class="dot" id="dot"></span><span id="statusText">bağlanılır…</span></span>
   </header>
-  <div class="sub">Telefonsuz · birbaşa mobil API · imzalar öz-özünə generasiya olunur · tam JSON</div>
+  <div class="sub">
+    <span class="pill">direct</span>
+    Warm cihaz kimliyi (device_id) + <b>birbaşa mobil API</b> · v46 imza (RapidAPI) ·
+    <code style="font-size:11px">/aweme/v1/general/search/single/</code> · cursor + search_id ilə real pagination
+  </div>
 
   <div class="panel">
     <div class="tabs" id="tabs">
@@ -98,7 +179,7 @@
       </div>
     </div>
     <div class="row">
-      <input type="text" id="q" placeholder="Axtarış sözü… (məs: climate change)" value="climate change"/>
+      <input type="text" id="q" placeholder="Axtarış sözü… (məs: ocean)" value="ocean"/>
       <button class="go" id="go">Axtar</button>
     </div>
     <div class="filters" id="filters">
@@ -118,69 +199,127 @@
           <option value="180">Son 6 ay</option>
         </select>
       </label>
+      <label>Limit
+        <select id="limit">
+          <option value="20">20</option>
+          <option value="40" selected>40</option>
+          <option value="60">60</option>
+        </select>
+      </label>
     </div>
   </div>
 
+  <div class="banner" id="banner"><span class="bi" id="bi"></span><span id="bmsg"></span></div>
+
   <div class="meta" id="meta"></div>
   <div class="grid" id="results"></div>
+
+  <footer>
+    Server: <code id="apiUrl"></code> · dəyişmək üçün <code>?api=http://host:port</code> əlavə edin.<br>
+    Cavab boş gəlirsə (<code>hit_shark</code>) və ya <code>429</code> → warm cookie/token köhnəlib
+    və ya RapidAPI kvotası bitib.
+  </footer>
 </div>
 
 <script>
-const API = "http://localhost:8000";
+// API base: override via ?api=... ; default localhost:8000
+const API = new URLSearchParams(location.search).get("api") || "http://localhost:8000";
 let kind = "keyword";
 const $ = s => document.querySelector(s);
+$("#apiUrl").textContent = API;
 
+/* ---- tabs ---- */
 document.querySelectorAll(".tab").forEach(t=>{
   t.onclick = ()=>{
     document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
     t.classList.add("active"); kind = t.dataset.t;
     $("#q").placeholder = kind==="user" ? "İstifadəçi adı… (məs: nasa)"
-      : kind==="hashtag" ? "Hashtag… (məs: bitcoin)" : "Axtarış sözü… (məs: climate change)";
-    // Filters apply to video searches only.
+      : kind==="hashtag" ? "Hashtag… (məs: bitcoin)" : "Axtarış sözü… (məs: ocean)";
     $("#filters").classList.toggle("hidden", kind==="user");
   };
 });
 
+/* ---- health ---- */
 async function health(){
   try{
-    const r = await fetch(API+"/health"); const d = await r.json();
-    $("#dot").classList.add("on");
-    $("#statusText").textContent = `${d.device_count} device · ${d.capacity_remaining_today}/${d.total_daily_capacity} sorğu qalıb`;
-  }catch(e){ $("#statusText").textContent = "server oflayn"; }
+    const r = await fetch(API+"/health");
+    const d = await r.json();
+    const dot = $("#dot");
+    dot.classList.remove("off"); dot.classList.add("on");
+    const cap = d.total_daily_capacity ? ` · ${d.capacity_remaining_today}/${d.total_daily_capacity} sorğu qalıb` : "";
+    $("#statusText").textContent = `${d.device_count} device${cap}`;
+  }catch(e){
+    const dot = $("#dot"); dot.classList.remove("on"); dot.classList.add("off");
+    $("#statusText").textContent = "server oflayn";
+  }
 }
+
+/* ---- helpers ---- */
 function fmt(n){ if(n==null) return "—";
   if(n>=1e6) return (n/1e6).toFixed(1)+"M"; if(n>=1e3) return (n/1e3).toFixed(1)+"K"; return n; }
 function esc(s){ return (s||"").replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function dur(s){ if(s==null) return null; const m=Math.floor(s/60), r=s%60; return m?`${m}:${String(r).padStart(2,"0")}`:`${r}s`; }
+function ago(iso){ if(!iso) return null; const d=new Date(iso); if(isNaN(d)) return null;
+  const days=Math.floor((Date.now()-d)/864e5);
+  if(days<1) return "bugün"; if(days<30) return days+"g öncə"; if(days<365) return Math.floor(days/30)+"ay öncə"; return Math.floor(days/365)+"il öncə"; }
 
+/* ---- banner ---- */
+function banner(kind, msg){
+  const b=$("#banner");
+  if(!kind){ b.className="banner"; return; }
+  b.className="banner show "+kind;
+  $("#bi").textContent = kind==="err" ? "⛔" : "⚠️";
+  $("#bmsg").innerHTML = msg;
+}
+
+/* ---- cards ---- */
 function card(it){
   if(it.type==="user"){
-    return `<div class="item"><div class="top">
-      <div class="av">${esc((it.username||"?")[0]||"?").toUpperCase()}</div>
-      <span class="uname">@${esc(it.username)}</span>
-      ${it.verified?'<span class="verified">✔ verified</span>':''}</div>
-      <div class="desc">${esc(it.display_name)||""}</div>
-      <div class="stats"><span><b>${fmt(it.follower_count)}</b> follower</span>
-      <span><b>${fmt(it.aweme_count)}</b> video</span>
-      <span>id: ${esc(it.user_id)||"—"}</span></div></div>`;
+    return `<div class="item">
+      <div class="top">
+        <div class="av">${esc((it.username||"?")[0]||"?").toUpperCase()}</div>
+        <span class="uname">@${esc(it.username)}</span>
+        ${it.verified?'<span class="verified">✔</span>':''}
+        ${it.region_code?`<span class="region">${esc(it.region_code)}</span>`:''}
+      </div>
+      <div class="desc">${esc(it.display_name)||"—"}</div>
+      ${it.signature?`<div class="desc" style="color:var(--muted);font-size:13px">${esc(it.signature)}</div>`:''}
+      <div class="stats">
+        <span>👥 <b>${fmt(it.follower_count)}</b> follower</span>
+        <span>➡ <b>${fmt(it.following_count)}</b></span>
+        <span>🎬 <b>${fmt(it.aweme_count)}</b> video</span>
+      </div>
+      <div class="subline"><span>id: ${esc(it.user_id)||"—"}</span></div>
+    </div>`;
   }
   const tags=(it.hashtags||[]).slice(0,6).map(h=>`<span class="tag">#${esc(h)}</span>`).join("");
-  return `<div class="item"><div class="top">
-    <div class="av">${esc((it.author_username||"?")[0]||"?").toUpperCase()}</div>
-    <span class="uname">@${esc(it.author_username)}</span></div>
+  const music = it.music_title ? `<span>🎵 ${esc(it.music_title)}</span>` : "";
+  const d = dur(it.duration), a = ago(it.create_time);
+  return `<div class="item">
+    <span class="id">${esc(it.id)}</span>
+    <div class="top">
+      <div class="av">${esc((it.author_username||"?")[0]||"?").toUpperCase()}</div>
+      <span class="uname">@${esc(it.author_username)}</span>
+      ${it.region_code?`<span class="region">${esc(it.region_code)}</span>`:''}
+    </div>
     <div class="desc">${esc(it.description)||"—"}</div>
     <div class="stats">
       <span>▶ <b>${fmt(it.view_count)}</b></span>
       <span>♥ <b>${fmt(it.like_count)}</b></span>
       <span>💬 <b>${fmt(it.comment_count)}</b></span>
-      <span>↗ <b>${fmt(it.share_count)}</b></span></div>
-    ${tags?`<div class="tags">${tags}</div>`:""}</div>`;
+      <span>↗ <b>${fmt(it.share_count)}</b></span>
+    </div>
+    <div class="subline">
+      ${d?`<span>⏱ ${d}</span>`:''}
+      ${a?`<span>📅 ${a}</span>`:''}
+      ${music}
+    </div>
+    ${tags?`<div class="tags">${tags}</div>`:""}
+  </div>`;
 }
 
-let view = "cards";       // "cards" | "json"
-let lastData = null;      // last /search response, for re-rendering on toggle
-
+/* ---- JSON view ---- */
 function hljson(obj){
-  // JSON.stringify with lightweight syntax highlighting.
   let j = JSON.stringify(obj, null, 2);
   j = j.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
   j = j.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"(\s*:)?/g,(m,_,colon)=>
@@ -190,15 +329,26 @@ function hljson(obj){
   return j;
 }
 
+let view = "cards", lastData = null;
+
 function render(){
   const box = $("#results");
+  box.classList.toggle("json-mode", view==="json");
   if(!lastData){ box.innerHTML=""; return; }
   if(view==="json"){
     box.innerHTML = `<pre class="json">${hljson(lastData)}</pre>`;
-  }else{
-    box.innerHTML = lastData.results.length ? lastData.results.map(card).join("")
-      : `<div class="empty">Nəticə tapılmadı — başqa söz sınayın.</div>`;
+    return;
   }
+  if(!lastData.results.length){
+    box.innerHTML = `<div class="empty"><div class="big">🔍</div>Nəticə tapılmadı — başqa söz sınayın.</div>`;
+    return;
+  }
+  let html = lastData.results.map(card).join("");
+  if(cursor!=null){
+    html += `<div class="morebar"><button class="more" id="more">Daha çox yüklə ↓</button></div>`;
+  }
+  box.innerHTML = html;
+  const m=$("#more"); if(m) m.onclick=loadMore;
 }
 
 document.querySelectorAll(".vt").forEach(v=>{
@@ -208,62 +358,75 @@ document.querySelectorAll(".vt").forEach(v=>{
   };
 });
 
-let cursor = 0;           // pagination cursor for the current query
-let accResults = [];      // accumulated results across pages
+/* ---- search + pagination ---- */
+let cursor = 0, accResults = [], startedAt = 0;
 
 function buildBody(q, cur){
-  const body = {type:kind, query:q, limit:50, cursor:cur||0};
-  if(kind!=="user"){                 // filters are video-only
-    const st = $("#sort_type").value, pt = $("#publish_time").value;
-    const filters = {};
-    if(st) filters.sort_type = st;
-    if(pt) filters.publish_time = pt;
-    if(Object.keys(filters).length) body.filters = filters;
+  const body = {type:kind, query:q, limit:parseInt($("#limit").value,10)||40, cursor:cur||0};
+  if(kind!=="user"){
+    const st=$("#sort_type").value, pt=$("#publish_time").value, f={};
+    if(st) f.sort_type=st; if(pt) f.publish_time=pt;
+    if(Object.keys(f).length) body.filters=f;
   }
   return body;
 }
 
 function renderMeta(d){
-  const more = d.has_more ? ` · <a href="#" id="more">daha çox ↓</a>` : "";
-  $("#meta").innerHTML =
-    `<b>${accResults.length}</b> nəticə · ${d.elapsed_s}s · device <b>${d.device}</b>`
-    + ` · cursor ${d.cursor}→${d.next_cursor==null?"—":d.next_cursor}${more}`;
-  const m = $("#more");
-  if(m) m.onclick = e => { e.preventDefault(); loadMore(); };
+  const parts = [
+    `<span class="chip">📦 <b>${accResults.length}</b> nəticə</span>`,
+    `<span class="chip">⚡ ${d.elapsed_s}s</span>`,
+    `<span class="chip">📱 device <b>${esc(String(d.device))}</b></span>`,
+    `<span class="chip">↔ cursor <span class="mono">${d.cursor}→${d.next_cursor==null?"son":d.next_cursor}</span></span>`,
+    `<span class="chip">${d.has_more?"🔁 daha var":"✅ tamam"}</span>`,
+  ];
+  $("#meta").innerHTML = parts.join("");
 }
 
 async function fetchPage(q, cur){
   const r = await fetch(API+"/search",{method:"POST",headers:{"content-type":"application/json"},
     body:JSON.stringify(buildBody(q, cur))});
-  const d = await r.json();
-  if(!r.ok) throw new Error(d.detail||r.status);
+  let d; try{ d = await r.json(); }catch{ d = {}; }
+  if(!r.ok){ const err = new Error(d.detail || (r.status+" "+r.statusText)); err.status=r.status; throw err; }
   return d;
+}
+
+function showError(e){
+  const msg = String(e.message||e);
+  if(e.status===429 || /quota|rate-limit/i.test(msg)){
+    banner("warn", `<b>Limit / kvota.</b> RapidAPI imza kvotası bitib və ya TikTok rate-limit etdi. Planı yüksəldin, təzə açar verin, ya da bir az gözləyin.<br><span style="color:var(--muted)">${esc(msg)}</span>`);
+  } else if(/hit_shark|empty search|nil/i.test(msg)){
+    banner("warn", `<b>Boş nəticə (risk-control).</b> Warm cookie/x-tt-token köhnəlmiş ola bilər — real app-dan təzə kimlik tutun.<br><span style="color:var(--muted)">${esc(msg)}</span>`);
+  } else {
+    banner("err", `<b>Xəta.</b> ${esc(msg)}`);
+  }
 }
 
 async function search(){
   const q = $("#q").value.trim(); if(!q) return;
+  banner(null);
   $("#go").disabled=true; lastData=null; accResults=[]; cursor=0;
-  $("#results").innerHTML=""; $("#meta").innerHTML = `<span class="spin"></span> axtarılır…`;
+  $("#results").innerHTML=""; $("#meta").innerHTML = `<span class="chip"><span class="spin"></span> axtarılır…</span>`;
   try{
     const d = await fetchPage(q, 0);
-    accResults = d.results.slice();
+    accResults = (d.results||[]).slice();
     cursor = d.next_cursor;
     lastData = {...d, results: accResults};
-    render(); renderMeta(d); health();
-  }catch(e){ $("#meta").textContent = "Xəta / server oflayn: "+e.message; }
-  finally{ $("#go").disabled=false; }
+    render(); renderMeta(d);
+  }catch(e){ $("#meta").innerHTML=""; showError(e); }
+  finally{ $("#go").disabled=false; health(); }
 }
 
 async function loadMore(){
   const q = $("#q").value.trim(); if(!q || cursor==null) return;
-  $("#meta").innerHTML += ` <span class="spin"></span>`;
+  const btn=$("#more"); if(btn){ btn.disabled=true; btn.innerHTML=`<span class="spin"></span> yüklənir…`; }
   try{
     const d = await fetchPage(q, cursor);
-    accResults = accResults.concat(d.results);
+    accResults = accResults.concat(d.results||[]);
     cursor = d.next_cursor;
     lastData = {...d, results: accResults};
-    render(); renderMeta(d); health();
-  }catch(e){ $("#meta").textContent = "Xəta: "+e.message; }
+    render(); renderMeta(d);
+  }catch(e){ showError(e); const b=$("#more"); if(b){b.disabled=false;b.textContent="Daha çox yüklə ↓";} }
+  finally{ health(); }
 }
 
 $("#go").onclick = search;

@@ -22,6 +22,32 @@ class ClientConfig:
     device_id: str | None = None
     iid: str | None = None
     proxy: str | None = None
+    # --- Direct-API (RapidAPI-signed) mode ------------------------------
+    # When rapidapi_key is set, the client signs each request via the RapidAPI
+    # v46 signer and hits the search host directly (GET query-param endpoint),
+    # instead of the vendored MetasecSigner. This is the path that actually
+    # returns real paginated results (see memory: direct-api-WORKS). It needs a
+    # WARM device identity (device_query below + at least a cookie or x_tt_token)
+    # captured from a logged-in real app.
+    rapidapi_key: str | None = None
+    rapidapi_host: str = 'tiktok-api-signer.p.rapidapi.com'
+    # Which RapidAPI signer schema to use. 'tiktanic' = tiktok-api-signer
+    # (/android/get_sign, dev_info body). 'working' = tiktok-signer-working
+    # (/sign, url+device_model+headers body, tracks v46.0.3). Switch providers
+    # when one's monthly quota is exhausted.
+    rapidapi_provider: str = 'tiktanic'
+    search_host: str = 'https://search19-normal-alisg.tiktokv.com'
+    # v46 signer params (must match the warm device's activated app version)
+    sign_app_version: str = '46.0.42'
+    sign_mssdk_ver_str: str = 'v05.01.02-alpha.7-ov-android'
+    sign_mssdk_ver_code: str = '83952160'
+    sign_license_id: str = '2142840551'
+    # Warm identity (per-device): cookie/token from a logged-in app, plus the
+    # full device query fingerprint (device_id/iid/cdid/openudid/region/...).
+    cookie: str | None = None
+    x_tt_token: str | None = None
+    user_agent: str | None = None
+    device_query: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def _field_names(cls) -> frozenset[str]:

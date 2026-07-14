@@ -1,0 +1,66 @@
+daily_request_cap_per_device: 500
+acquire_timeout_s: 60
+max_results_per_search: 60
+request_timeout_s: 25
+retries: 2
+default_fan_out: 1
+rapidapi_key: 64965c4482msh7099afc29ead0a9p14dc47jsn2423fe44aba5
+rapidapi_host: tiktok-api-signer.p.rapidapi.com
+search_host: https://search19-normal-alisg.tiktokv.com
+sign_app_version: 46.0.42
+sign_mssdk_ver_str: v05.01.02-alpha.7-ov-android
+sign_mssdk_ver_code: '83952160'
+sign_license_id: '2142840551'
+app_id: 1233
+device_type: sdk_gphone64_arm64
+os_version: '16'
+channel: beta_closedtesting
+devices:
+- device_id: '7662037606577948173'
+  iid: '7662039289244616468'
+  cookie: multi_sids=7659773676758221832%3Acf03876e9ca26547d45035cebb3c6856, cmpl_token=AgQYAPNb_hfkT7C6chU07z0dMfA0n6gMXH-P2WCmN-Y, d_ticket=cc4d6670f55d997894f222e587f86e0d875f7, sid_guard=cf03876e9ca26547d45035cebb3c6856%7C1783957576%7C15552000%7CSat%2C+09-Jan-2027+15%3A46%3A16+GMT, uid_tt=92a066b8d3ae17d189f9eaa715530d83e1625a5066b9498f4877624b9962d13c, uid_tt_ss=92a066b8d3ae17d189f9eaa715530d83e1625a5066b9498f4877624b9962d13c, sid_tt=cf03876e9ca26547d45035cebb3c6856, sessionid=cf03876e9ca26547d45035cebb3c6856, sessionid_ss=cf03876e9ca26547d45035cebb3c6856, tt_session_tlb_tag=sttt%7C3%7CzwOHbpyiZUfUUDXOuzxoVv_________HV6PRNvgNEKlA5v1vHJT79uwjzPrxlH9VzFiIB_PTEX0%3D, store-idc=alisg, store-country-sign=MEIEDE8euc3TfU4ACwU0ggQg-N2pL3fU98RVBGam-zy1Kl5IuJ_C793otXN2aMthXBIEEE6akXFfkCEcylrZO7YG0cY, store-country-code=az, store-country-code-src=uid, tt-target-idc=alisg, odin_tt=ce9744c4d81514477ee7777db8445ae6aba7f82591e727ca6263cd0c6d99bc4db7817fef2b922028c01eb90dee981bedadf8ae6ac9283abeefcffc29d2e851391449847942d5295adeeffa55451c2ca2, msToken=Hww5kKP2n7lKwhEBw5DmGg7N6mbCwaSwQ5tkytbXoSsh1_ncjiZ0CL4Ai0iO5AonLS-YNY1pdTE00hTJQdQLlPwFHT764kFm88Yfs30pkOQ=, install_id=7662039289244616468, ttreq=1$aabac58ab105b4f9e30daa7d0bdee7bb53ca779e
+  x_tt_token: 03cf03876e9ca26547d45035cebb3c68560610a50f200a1e6f0b2e3b0aeac688405cee6087be1342a16da44a09fea050626217793f39cdeb65c1ee475588c212c910820588b4fb7a6a3fc4973c32a0443f015fa0f441764902fd5b59c00b90687c098--0a4e0a20c16d48148e03e0853d9b9a79ed984658b2175719ab01e3d51e7f752e42f24176122040ece043a30f9781e3926c1bc2132ee06d520f2341551541174055124b6f194d1801220674696b746f6b-3.0.1
+  user_agent: com.zhiliaoapp.musically/2024600420 (Linux; U; Android 16; en_US; sdk_gphone64_arm64; Build/BE2A.250530.026.F3; Cronet/TTNetVersion:3a9f3ddf 2026-06-25 QuicVersion:c3b23989 2026-06-25)
+  device_query:
+    device_platform: android
+    os: android
+    ssmix: a
+    cdid: b05d39d2-911b-4217-b785-7e7b34e7a681
+    channel: beta_closedtesting
+    aid: '1233'
+    app_name: musical_ly
+    version_code: '460042'
+    version_name: 46.0.42
+    manifest_version_code: '2024600420'
+    update_version_code: '2024600420'
+    ab_version: 46.0.42
+    resolution: 1440*3120
+    dpi: '560'
+    device_type: sdk_gphone64_arm64
+    device_brand: google
+    language: en
+    os_api: '36'
+    os_version: '16'
+    ac: wifi
+    is_pad: '0'
+    app_type: normal
+    sys_region: US
+    last_install_time: '1783956846'
+    mcc_mnc: '310260'
+    timezone_name: Asia/Baku
+    carrier_region_v2: '310'
+    app_language: en
+    carrier_region: US
+    timezone_offset: '14400'
+    host_abi: arm64-v8a
+    locale: en
+    ac2: wifi
+    uoo: '0'
+    op_region: US
+    build_number: 46.0.42
+    region: US
+    iid: '7662039289244616468'
+    device_id: '7662037606577948173'
+    openudid: 7ed62a3e99739e2b
+synthetic_devices: 0
+proxies: []
