@@ -185,13 +185,19 @@ class TikTokClient:
                 logger.warning('soft error (attempt %d): %s', attempt, message)
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            # direct mode: detect risk-control empty ("hit_shark") so callers see a clear error
+            # direct mode: detect risk-control empty ("hit_shark") so callers see a
+            # clear error instead of a silent 200 + empty results. TikTok signals a
+            # soft-block several ways: an explicit search_nil_info, OR simply an empty
+            # item list with has_more=false (no nil block at all). Both mean the
+            # device/identity was shadow-rejected — retry (rotates timestamps) then fail.
             if self._direct and isinstance(data, dict):
                 nil = (data.get('search_nil_info') or {}).get('search_nil_item')
                 items_any = (data.get('data') or []) or (data.get('search_item_list') or [])
-                if nil and not items_any:
-                    last_err = SoftError(f'empty search result ({nil})')
-                    logger.warning('empty result (attempt %d): %s', attempt, nil)
+                soft_empty = (not items_any) and not bool(data.get('has_more'))
+                if nil or soft_empty:
+                    reason = nil if nil else 'no items, has_more=false (shadow-block)'
+                    last_err = SoftError(f'empty search result ({reason})')
+                    logger.warning('empty result (attempt %d, device=%s, path=%s): %s', attempt, self.device_id, path, reason)
                     time.sleep(0.5 * (attempt + 1))
                     continue
             return data

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -8,10 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from ..config import PoolConfig
 from ..errors import PoolExhausted, RateLimited, SoftError, TransportError
 from ..filters import SearchFilters, SearchQuery
+from ..identity_manager import IdentityStore
 from ..pool import ClientPool
 from .schemas import HealthResponse, SearchRequest, SearchResponse
 logger = logging.getLogger('tiktoksearch.api')
 DEFAULT_CONFIG_PATH = 'config_signed.yaml'
+# Optional hot-reloadable warm-identity file. Env override wins; else config's
+# `identities_path`; else a conventional default next to the config.
+IDENTITIES_ENV = 'TIKTOK_IDENTITIES_PATH'
 
 def _to_query(req: SearchRequest, max_results: int) -> SearchQuery:
     filters = SearchFilters(sort_type=req.filters.sort_type if req.filters else None, publish_time=req.filters.publish_time if req.filters else None)
@@ -23,14 +28,40 @@ def _to_query(req: SearchRequest, max_results: int) -> SearchQuery:
 def get_pool(request: Request) -> ClientPool:
     return request.app.state.pool
 
+def _resolve_identities_path(config_path: str) -> str | None:
+    """Where to read hot-reloadable warm identities from, if anywhere."""
+    env = os.environ.get(IDENTITIES_ENV)
+    if env:
+        return env
+    # config yaml may carry `identities_path`
+    try:
+        import yaml
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                raw = yaml.safe_load(f) or {}
+            p = raw.get('identities_path')
+            if p:
+                return p
+    except Exception:  # pragma: no cover - config parsing already validated elsewhere
+        pass
+    # conventional default alongside the config
+    default = os.path.join(os.path.dirname(os.path.abspath(config_path)) or '.', 'identities.json')
+    return default if os.path.exists(default) else None
+
+
 def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
     config = PoolConfig.load_yaml(config_path)
+    identities_path = _resolve_identities_path(config_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.pool = ClientPool(config)
+        identities = IdentityStore(identities_path) if identities_path else None
+        app.state.identities = identities
+        app.state.pool = ClientPool(config, identities=identities)
         app.state.config = config
         status = app.state.pool.status()
+        if identities is not None:
+            logger.info('Warm-identity store: %s (%d usable).', identities_path, identities.usable_count())
         logger.info('Signed search API up. %d device(s), total capacity %d/day.', status['device_count'], status['total_daily_capacity'])
         yield
         logger.info('Signed search API shutting down.')

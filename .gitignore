@@ -22,3 +22,8 @@ __pycache__/
 *.log
 data/
 data_*/
+
+# Warm identities — contain live cookie/x-tt-token, never commit
+identities.json
+identities.json.tmp
+warm_device_query.json

@@ -4,6 +4,12 @@ max_results_per_search: 60
 request_timeout_s: 25
 retries: 2
 default_fan_out: 1
+# Hot-reloadable warm identities. When this file exists it takes precedence over
+# the static `devices:` list below. The capture loop (emulator + mitmproxy +
+# capture_identity_addon.py) rewrites it whenever the app refreshes its session,
+# and the running API auto-reloads it — so an expired cookie/x-tt-token is
+# replaced without a restart. Falls back to `devices:` if the file is missing.
+identities_path: identities.json
 rapidapi_key: 64965c4482msh7099afc29ead0a9p14dc47jsn2423fe44aba5
 rapidapi_host: tiktok-api-signer.p.rapidapi.com
 search_host: https://search19-normal-alisg.tiktokv.com
