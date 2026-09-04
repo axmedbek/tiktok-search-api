@@ -33,7 +33,10 @@ def _resolve_identities_path(config_path: str) -> str | None:
     env = os.environ.get(IDENTITIES_ENV)
     if env:
         return env
-    # config yaml may carry `identities_path`
+    config_dir = os.path.dirname(os.path.abspath(config_path)) or '.'
+    # config yaml may carry `identities_path` — a relative path is resolved
+    # against the CONFIG's directory, not the process cwd, so the server works
+    # no matter where it is launched from.
     try:
         import yaml
         if os.path.exists(config_path):
@@ -41,11 +44,11 @@ def _resolve_identities_path(config_path: str) -> str | None:
                 raw = yaml.safe_load(f) or {}
             p = raw.get('identities_path')
             if p:
-                return p
+                return p if os.path.isabs(p) else os.path.join(config_dir, p)
     except Exception:  # pragma: no cover - config parsing already validated elsewhere
         pass
     # conventional default alongside the config
-    default = os.path.join(os.path.dirname(os.path.abspath(config_path)) or '.', 'identities.json')
+    default = os.path.join(config_dir, 'identities.json')
     return default if os.path.exists(default) else None
 
 

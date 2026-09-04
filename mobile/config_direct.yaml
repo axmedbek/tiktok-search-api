@@ -69,4 +69,13 @@ devices:
     device_id: '7662037606577948173'
     openudid: 7ed62a3e99739e2b
 synthetic_devices: 0
-proxies: []
+# Proxies — round-robin assigned to identities/devices (identity#1 -> proxies[0], …).
+# Format is a full requests-style URL: scheme://user:pass@host:port
+# Use RESIDENTIAL/mobile proxies (http or socks5); datacenter IPs are blocked by TikTok.
+#   http  with auth : http://USER:PASS@HOST:PORT
+#   http  no  auth  : http://HOST:PORT
+#   socks5 with auth: socks5://USER:PASS@HOST:PORT   (needs: pip install requests[socks])
+proxies:
+  # - http://user123:pass456@proxy.example.com:8080
+  # - socks5://user123:pass456@proxy.example.com:1080
+  []
