@@ -4,6 +4,9 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping
 import yaml
 DEFAULT_HOSTS: tuple[str, ...] = ('https://api16-normal-c-useast1a.tiktokv.com', 'https://api16-normal-c-useast2a.tiktokv.com', 'https://api19-normal-c-useast1a.tiktokv.com')
+# Env var that overrides the YAML `rapidapi_key`, so the key never has to be
+# committed in a config profile (see .env.example). Empty/unset falls back to YAML.
+RAPIDAPI_KEY_ENV = 'RAPIDAPI_KEY'
 
 @dataclass(frozen=True, slots=True)
 class ClientConfig:
@@ -59,6 +62,9 @@ class ClientConfig:
         data = {k: v for k, v in cfg.items() if k in known}
         if 'api_hosts' in data and data['api_hosts']:
             data['api_hosts'] = tuple(data['api_hosts'])
+        env_key = os.environ.get(RAPIDAPI_KEY_ENV, '').strip()
+        if env_key:
+            data['rapidapi_key'] = env_key
         return cls(**data)
 
     def with_overrides(self, device_cfg: Mapping[str, Any]) -> 'ClientConfig':

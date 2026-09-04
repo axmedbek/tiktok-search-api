@@ -6,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from ..config import PoolConfig
+from ..config import RAPIDAPI_KEY_ENV, PoolConfig
 from ..errors import PoolExhausted, RateLimited, SoftError, TransportError
 from ..filters import SearchFilters, SearchQuery
 from ..identity_manager import IdentityStore
@@ -17,6 +17,22 @@ DEFAULT_CONFIG_PATH = 'config_signed.yaml'
 # Optional hot-reloadable warm-identity file. Env override wins; else config's
 # `identities_path`; else a conventional default next to the config.
 IDENTITIES_ENV = 'TIKTOK_IDENTITIES_PATH'
+# Startup misconfiguration banners. Both are logged loudly (ERROR) and never
+# raise: config_signed.yaml is a legitimate legacy profile with no rapidapi_key.
+# Neither message may carry key material — they state absence only.
+MISSING_CONFIG_MSG = (
+    'Config file not found: %s — the API is running on built-in defaults '
+    '(no configured devices, no warm identity, and the %s env override is NOT '
+    'applied on this path). In a container this means the config bind mount is '
+    'missing or misnamed.'
+)
+NO_SIGNER_KEY_MSG = (
+    'No signer key configured: %s is unset/empty in the environment and '
+    '`rapidapi_key` is absent from the config profile. Requests will run the COLD '
+    'legacy signer path, which returns empty results BY DESIGN. An empty result in '
+    'this state is a configuration problem, not hit_shark risk-control. Set %s in '
+    '.env (see .env.example) and restart.'
+)
 
 def _to_query(req: SearchRequest, max_results: int) -> SearchQuery:
     filters = SearchFilters(sort_type=req.filters.sort_type if req.filters else None, publish_time=req.filters.publish_time if req.filters else None)
@@ -54,6 +70,9 @@ def _resolve_identities_path(config_path: str) -> str | None:
 
 def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
     config = PoolConfig.load_yaml(config_path)
+    # load_yaml falls back to all-defaults for a missing path; remember that so
+    # startup can say so out loud (its return contract stays unchanged).
+    config_missing = not os.path.exists(config_path)
     identities_path = _resolve_identities_path(config_path)
 
     @asynccontextmanager
@@ -66,6 +85,10 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
         if identities is not None:
             logger.info('Warm-identity store: %s (%d usable).', identities_path, identities.usable_count())
         logger.info('Signed search API up. %d device(s), total capacity %d/day.', status['device_count'], status['total_daily_capacity'])
+        if config_missing:
+            logger.error(MISSING_CONFIG_MSG, config_path, RAPIDAPI_KEY_ENV)
+        if not config.client_defaults.rapidapi_key:
+            logger.error(NO_SIGNER_KEY_MSG, RAPIDAPI_KEY_ENV, RAPIDAPI_KEY_ENV)
         yield
         logger.info('Signed search API shutting down.')
     app = FastAPI(title='TikTok Mobile Search API', version='2.0', summary="Signed direct access to TikTok's mobile search — no phone, no login.", lifespan=lifespan)

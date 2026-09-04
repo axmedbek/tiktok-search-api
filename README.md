@@ -33,8 +33,40 @@ pip install -r requirements.txt
 
 ## 3. Run
 
+### With Docker (API + demo UI)
+
 ```bash
-python mobile/api_signed.py --config mobile/config_signed.yaml --port 8000
+cp .env.example .env          # then put your RapidAPI signer key in it
+docker compose up -d --build
+docker compose logs -f api    # expect: "Signed search API up. N device(s) …"
+```
+
+| URL | What |
+|-----|------|
+| `http://localhost:8000` | the API (`/search`, `/health`, `/docs`) |
+| `http://localhost:8080` | the demo UI (`mobile/demo.html`, served by nginx) |
+
+Both ports bind **loopback only**. `/search` has no authentication, signs with a
+live warm identity and spends paid signer quota, and the services are
+`restart: unless-stopped` — so they are deliberately not published on all
+interfaces. For remote access put a tunnel in front:
+`cloudflared tunnel --url http://127.0.0.1:8000`, then point the UI at it with
+`http://localhost:8080/?api=https://<tunnel-host>`.
+
+Config and warm identities are **bind-mounted read-only** from `./mobile` to
+`/app/config` — nothing secret is baked into the image (see `.dockerignore`).
+The whole directory is mounted, not individual files, so the capture loop's
+atomic `os.replace()` of `identities.json` stays visible to the container and
+hot-reload keeps working.
+
+> If `RAPIDAPI_KEY` is unset and the profile's `rapidapi_key:` is blank, startup
+> logs a loud `ERROR` and searches return **empty** — that is configuration, not
+> `hit_shark`. Check `docker compose logs api` first.
+
+### Natively
+
+```bash
+python mobile/api_signed.py --config mobile/config_direct.yaml --port 8000
 # or:
 uvicorn mobile.api_signed:app --port 8000     # uses $TTAPI_SIGNED_CONFIG
 ```
@@ -269,6 +301,10 @@ cd mobile
 ## 9. Project layout
 
 ```
+Dockerfile                   API image (python:3.11-slim, non-root)
+docker-compose.yml           api (:8000) + ui (nginx, :8080), loopback-bound
+.dockerignore                keeps configs/identities out of image layers
+.env.example                 RAPIDAPI_KEY template
 requirements.txt
 mobile/
 ├── api_signed.py            entrypoint (thin shim -> tiktoksearch.api.create_app)

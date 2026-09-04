@@ -1,0 +1,45 @@
+# Never ship live secrets into an image layer.
+# Config profiles carry rapidapi_key / cookie / x_tt_token; identities.json is
+# a warm identity store. All of these are bind-mounted read-only at runtime.
+mobile/*.yaml
+mobile/*.yml
+mobile/identities.json*
+mobile/warm_device_query.json
+.env
+.env.*
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Virtual environments
+.venv
+venv
+env
+
+# Tests are not run in the image (pytest runs on the host, per agents-config).
+mobile/tiktoksearch/tests
+
+# Python caches / build artifacts
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Agent / tooling metadata
+.claude
+.serena
+.idea
+.vscode
+
+# Docs (not needed at runtime)
+agent_docs
+*.md
+**/*.md
+implementation_plan.md
+
+# OS
+.DS_Store

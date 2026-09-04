@@ -13,9 +13,10 @@ Single source of project-specific commands, versions, and conventions. Every age
 
 ## Commands
 
-- **Virtualenv:** `.venv/` at repo root. Always invoke as `.venv/bin/python` (repo root) or `../.venv/bin/python` (from `mobile/`). The venv is Python 3.11; the system `python3`/`python` may be older or missing `yaml`/`requests`.
+- **Virtualenv:** `.venv/` at repo root. Always invoke as `.venv/bin/python` (repo root) or `../.venv/bin/python` (from `mobile/`). The system `python3`/`python` may be missing `yaml`/`requests`/`gmssl` — `import tiktoksearch` pulls the vendored signer chain and fails without `gmssl`, so isolate `config.py` with `importlib` (registering the module in `sys.modules` first, required for `slots=True` dataclasses) when testing config outside the venv. On this machine the venv is Python 3.12 and `ensurepip` is unavailable, so it was bootstrapped with `get-pip.py`; the Docker image pins 3.11.
 - **Run tests:** `cd mobile && ../.venv/bin/python -m pytest tiktoksearch/tests -q`
 - **Run the API (dev):** `.venv/bin/python mobile/api_signed.py --config mobile/config_direct.yaml --host 127.0.0.1 --port 8000`
+- **Run via Docker:** `cp .env.example .env` (set `RAPIDAPI_KEY`), then `docker compose up -d --build`. API on `127.0.0.1:8000`, demo UI on `127.0.0.1:8080`. Logs: `docker compose logs -f api`. Stop: `docker compose down`.
 - **Public tunnel (dev):** `cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate`
 - **Lint:** none configured. Code review is the only style gate — follow `.claude/rules/code-standards.md`.
 - **Type checker:** none configured (no mypy/pyright). Type hints are documentation, not enforced.

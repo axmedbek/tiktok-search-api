@@ -54,6 +54,18 @@ TikTok returns HTTP 200 with an **empty** `data[]` (and often a `search_nil_info
 
 The architecture's answer: **warm, hot-reloadable identities with health tracking** (IdentityStore) + **residential proxy rotation** (pool) + **a capture loop** that refreshes credentials before they fully expire.
 
+## Deployment (Docker)
+
+`docker compose up` runs two services: `api` (built from `Dockerfile`, `python:3.11-slim`, non-root) on `127.0.0.1:8000`, and `ui` (`nginx:alpine`) serving `mobile/demo.html` on `127.0.0.1:8080`. The non-obvious parts:
+
+- **Config and identities are bind-mounted, never copied.** `./mobile` is mounted read-only at `/app/config`, and `.dockerignore` excludes `mobile/*.yaml` + `mobile/identities.json*` from the build context, so no live `cookie` / `x_tt_token` / `rapidapi_key` reaches an image layer. The signer key comes from `RAPIDAPI_KEY` (`.env`), which `ClientConfig.from_mapping` lets win over the YAML value.
+- **The whole directory is mounted, not the individual files.** `capture_identity_addon.py` writes `identities.json.tmp` then `os.replace()`s it; a *file* bind mount pins the host inode, so an atomic rename would be invisible inside the container forever. The directory mount is what makes mtime hot-reload work at all — and it also avoids Docker creating a stray host *directory* for the not-yet-existing `identities.json`.
+- **Ports bind loopback only.** `/search` is unauthenticated, signs with a live warm identity and spends paid signer quota, and the services are `restart: unless-stopped`. Remote access is the tunnel's job (`demo.html` already accepts `?api=`).
+- **`CMD` passes no `--config`.** `api_signed.py` builds a module-level `app` from `TTAPI_SIGNED_CONFIG`; `main()` only re-creates it when `args.config != _CONFIG`. Omitting the flag keeps them equal, so the pool is built once.
+- **Code lands at `/app/tiktoksearch`** (not `/app/mobile/tiktoksearch`) because `api_signed.py` inserts its own directory onto `sys.path`.
+- **A missing `identities.json` degrades, it does not raise.** `_resolve_identities_path` returns the env value without an existence check; `IdentityStore.reload` catches the `OSError`, logs `identities file … not found`, and `ClientPool._build_slots` falls back to the config's static `devices:` list (label `dev0`, not `id0`).
+- **Startup announces misconfiguration loudly.** `create_app` logs `ERROR` when the config path is absent, and when no `rapidapi_key` is configured — because a falsy key flips `client.py`'s `_direct` to the cold legacy signer, which also disables the hit_shark guard, so empties would otherwise surface as a silent `200` with `count: 0`. The banner is boot-only; `/health` still reports `ok`.
+
 ## Data flow invariants
 
 - `data[]` from `/aweme/v1/general/search/single/` is **mixed** — most items are videos (`type=1`, wrapped in `aweme_info`, has `aweme_id`), some are user cards / ads (no `aweme_id`). `client.py` `unwrap` and `mapping.py` skip non-video items. Never assume `data[0]` is a video.

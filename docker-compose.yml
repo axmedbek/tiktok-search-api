@@ -1,0 +1,30 @@
+services:
+  api:
+    build: .
+    # Loopback only: /search has no auth, signs with the mounted warm identity
+    # (a live sessionid) and spends RapidAPI quota, and restart:unless-stopped
+    # makes it survive reboots. Remote access is the tunnel's job, not a
+    # published all-interfaces port.
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      TTAPI_SIGNED_CONFIG: /app/config/config_direct.yaml
+      TIKTOK_IDENTITIES_PATH: /app/config/identities.json
+      RAPIDAPI_KEY: ${RAPIDAPI_KEY:-}
+    # Mount the whole directory, not the individual files: identities.json may
+    # not exist yet (a bind mount of a missing file makes Docker create a stray
+    # directory on the host and break IdentityStore), and mounting the dir keeps
+    # mtime hot-reload working when the capture loop rewrites it.
+    volumes:
+      - ./mobile:/app/config:ro
+    restart: unless-stopped
+
+  ui:
+    image: nginx:alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./mobile/demo.html:/usr/share/nginx/html/index.html:ro
+    depends_on:
+      - api
+    restart: unless-stopped

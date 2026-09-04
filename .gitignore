@@ -19,6 +19,7 @@ __pycache__/
 .DS_Store
 
 # Local secrets / data
+.env
 *.log
 data/
 data_*/
