@@ -34,6 +34,19 @@ Why merge both: `single/` alone stops at ~30 with `has_more=false`. Chaining the
 - **Tokens die on restart** (the HMAC secret is per-process) → `422`, not a resumable session. The service is single-process by design; `uvicorn --workers` was never supported.
 - **`fan_out`**: a session lives on one device, so an explicitly supplied `fan_out > 1` with a `page_token` is a `422`, while the server's `default_fan_out` is silently coerced to 1. A merged (`run_merged`) page mints no token at all.
 - Rejected token (malformed, tampered, wrong query, out of bounds) → **422**, never a 502.
+- **`next_cursor` looks stuck on the merged video path** — it tracks the *primary* endpoint only, so a keyword/hashtag stream can show `cursor=30, next_cursor=30` for six consecutive pages while each page returns 30 fresh records. It advances normally for single-endpoint user search. Informational only; judge progress by `page_token` and `has_more`, never by the cursor.
+- **A token is not an idempotency key.** TikTok re-ranks at a given cursor, so replaying the same token returns *different* records (measured: two 10-record pages, zero overlap). A repeated continuation means "more results", not a safe replay — never cache responses keyed on token identity.
+- **Dedup is exact only inside the trailing window.** Measured live: a 15-page user chain served 421 records with 2 duplicates, both re-emitted after falling out of the 240-record window. A caller needing global uniqueness over a deep stream dedupes on its own side.
+
+## How deep a stream actually goes (measured, `signer: local`, `limit=30`)
+
+| kind | pages to exhaustion | records | duplicates |
+|---|---|---|---|
+| keyword | 7 | 206 | 0 |
+| hashtag | 6 | 160 | 0 |
+| user | 15 | 421 | 2 |
+
+The end of a stream is a short partial page with `has_more: false` and `page_token: null` — a normal `200`, never a 502. A literal `count: 0` terminal page is unreachable, because the last real page mints no token. The user chain stopped on `MAX_PAGES_PER_ENDPOINT`, not on TikTok exhaustion.
 
 ## fan_out (pool.run_merged)
 `run_merged(query, fan_out)` clamps `fan_out` to `[1, pool size]`, queries that many devices in parallel via a `ThreadPoolExecutor`, and merges+dedupes all their pages into one `SearchPage` (each device returns a shallow window from a different identity/proxy, so union = more unique results). Costs one daily-cap unit per device used.

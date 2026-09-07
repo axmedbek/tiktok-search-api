@@ -8,7 +8,7 @@ from functools import partial
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from ..client import SEARCH_PATHS
-from ..config import RAPIDAPI_KEY_ENV, PoolConfig
+from ..config import RAPIDAPI_KEY_ENV, SIGNER_LEGACY, SIGNER_RAPID, PoolConfig
 from ..errors import PoolCode, PoolExhausted, RateLimited, SoftError, TransportError
 from ..filters import SearchFilters, SearchPage, SearchQuery
 from ..identity_manager import IdentityStore
@@ -20,9 +20,11 @@ DEFAULT_CONFIG_PATH = 'config_signed.yaml'
 # Optional hot-reloadable warm-identity file. Env override wins; else config's
 # `identities_path`; else a conventional default next to the config.
 IDENTITIES_ENV = 'TIKTOK_IDENTITIES_PATH'
-# Startup misconfiguration banners. Both are logged loudly (ERROR) and never
-# raise: config_signed.yaml is a legitimate legacy profile with no rapidapi_key.
-# Neither message may carry key material — they state absence only.
+# Startup misconfiguration banners. MISSING_CONFIG_MSG and NO_SIGNER_KEY_MSG are
+# logged loudly (ERROR) and never raise: config_signed.yaml is a legitimate
+# legacy profile with no rapidapi_key, and the cold path it selects does still
+# start and serve. RAPID_WITHOUT_KEY_MSG is the one that DOES raise — see
+# create_app. No message may carry key material — they state absence only.
 MISSING_CONFIG_MSG = (
     'Config file not found: %s — the API is running on built-in defaults '
     '(no configured devices, no warm identity, and the %s env override is NOT '
@@ -41,12 +43,35 @@ FAN_OUT_TOKEN_CONFLICT_MSG = (
     'fan_out > 1 cannot be combined with page_token: a search session lives on '
     'a single device. Send fan_out=1 or drop page_token.'
 )
+# Which signer is live, so `docker compose logs` answers it without guesswork.
+# Args are the resolved mode and the raw `signer:` value — both are mode names,
+# never key material.
+SIGNER_MODE_MSG = 'Signer: %s (config `signer:` = %s).'
+# Fires ONLY for the resolved `legacy` mode — the one keyless mode that still
+# starts, since a keyless `rapid` is refused in create_app and `local` needs no
+# key at all — so every claim here is true for the single branch that reaches it.
+# The remedy names BOTH exits on purpose: an explicitly configured
+# `signer: legacy` ignores the env key, so setting it alone would change nothing.
 NO_SIGNER_KEY_MSG = (
     'No signer key configured: %s is unset/empty in the environment and '
-    '`rapidapi_key` is absent from the config profile. Requests will run the COLD '
-    'legacy signer path, which returns empty results BY DESIGN. An empty result in '
-    'this state is a configuration problem, not hit_shark risk-control. Set %s in '
-    '.env (see .env.example) and restart.'
+    '`rapidapi_key` is absent from the config profile, so the resolved signer is '
+    'the COLD legacy path, which returns empty results BY DESIGN. An empty result '
+    'in this state is a configuration problem, not hit_shark risk-control. Set '
+    '`signer: local` in the config profile for free in-process v46 signing, or '
+    '`signer: rapid` plus %s in .env (see .env.example), and restart.'
+)
+# The fatal one. `signer: rapid` is an explicit request for the paid signer, and
+# RapidSigner raises on construction without a key, so EVERY client in the pool
+# would fail to build — the failure is a configuration error and is named as one.
+RAPID_WITHOUT_KEY_MSG = (
+    'Config `signer: rapid` selects the paid RapidAPI signer, but no key is '
+    'configured: %s is unset/empty in the environment and `rapidapi_key` is '
+    'absent from the config profile. That signer cannot sign a single request '
+    'without a key, so the server refuses to start rather than fail every '
+    'search. Set %s in .env (see .env.example), or switch the profile to '
+    '`signer: local` for free in-process v46 signing. No other signer is '
+    'substituted: `signer: rapid` is the stale-sign-key diagnostic, and quietly '
+    'serving a different one would destroy the signal it exists to give.'
 )
 
 def _query_hash(kind: str, term: str, filters: SearchFilters) -> str:
@@ -117,6 +142,14 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
     # startup can say so out loud (its return contract stays unchanged).
     config_missing = not os.path.exists(config_path)
     identities_path = _resolve_identities_path(config_path)
+    client_defaults = config.client_defaults
+    signer_mode = client_defaults.resolved_signer()
+    # Resolved HERE, before any client is constructed, because a keyless `rapid`
+    # is fatal: RapidSigner raises on construction, so ClientPool would take the
+    # process down with a bare ValueError before startup reached any banner.
+    if signer_mode == SIGNER_RAPID and not client_defaults.rapidapi_key:
+        logger.error(RAPID_WITHOUT_KEY_MSG, RAPIDAPI_KEY_ENV, RAPIDAPI_KEY_ENV)
+        raise ValueError(RAPID_WITHOUT_KEY_MSG % (RAPIDAPI_KEY_ENV, RAPIDAPI_KEY_ENV))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -132,7 +165,15 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
             logger.warning(FAN_OUT_NO_TOKEN_MSG, config.default_fan_out)
         if config_missing:
             logger.error(MISSING_CONFIG_MSG, config_path, RAPIDAPI_KEY_ENV)
-        if not config.client_defaults.rapidapi_key:
+        logger.info(SIGNER_MODE_MSG, signer_mode, client_defaults.signer or 'unset')
+        # The banner is about running a path that CANNOT return results: `legacy`
+        # — what an unset `signer:` with no key resolves to — is the cold path
+        # that returns empty BY DESIGN, the silent-empty misconfiguration this
+        # banner exists for. `rapid` without a key never gets here (create_app
+        # refused it), and in `local` mode a missing key is normal: local signing
+        # is free, and RapidAPI is only the narrow fallback for a failed local
+        # SIGNING call.
+        if signer_mode == SIGNER_LEGACY and not client_defaults.rapidapi_key:
             logger.error(NO_SIGNER_KEY_MSG, RAPIDAPI_KEY_ENV, RAPIDAPI_KEY_ENV)
         yield
         logger.info('Signed search API shutting down.')

@@ -1,11 +1,26 @@
-"""RapidAPI-backed v46 signer.
+"""RapidAPI-backed v46 signer — the FALLBACK, no longer the default.
 
-The vendored pure-Python MetasecSigner produces a v37-era x-argus that TikTok's
-v46 risk-control ("Shark") rejects to an empty result. The RapidAPI signer
-(`tiktok-api-signer`) returns a v46-consistent x-argus/x-gorgon/x-ladon/x-khronos
-that, paired with a warm v46 device identity, returns real search results.
+The RapidAPI signer (`tiktok-api-signer`) returns a v46-consistent
+x-argus/x-gorgon/x-ladon/x-khronos that, paired with a warm v46 device identity,
+returns real search results. It costs money and monthly quota per signature.
 
-See memory: direct-api-WORKS, signer-repos-surveyed-v46.
+It is not the only signer that works on v46. The vendored pure-Python
+`MetasecSigner` also does, once it is fed the `sign_*` v46 params plus a warm
+identity (`signing.MetasecSigner.for_v46`) — the old "keys frozen at v37"
+verdict measured a real failure but named the wrong cause: `signing.py` was
+handing the signer `ClientConfig`'s v32 defaults and attaching no identity.
+`metasec.DEFAULT_SIGN_KEY` still holds because `mssdk_ver_code 83952160` is
+shared between the 37.x and 46.x builds. `signer: local` is therefore the
+default profile's choice, and this module covers two things it cannot:
+
+* hard signing failures on the local path (`client._rapid_fallback`), and
+* the diagnostic for a stale `DEFAULT_SIGN_KEY` after an MSSDK bump — that
+  failure is silent (a well-formed signature answered with an empty `data[]`),
+  and flipping a profile to `signer: rapid` is the only signal that separates it
+  from expired identities.
+
+See `.claude/skills/tiktok-signing/SKILL.md`; memory: direct-api-WORKS,
+signer-repos-surveyed-v46.
 """
 from __future__ import annotations
 import base64

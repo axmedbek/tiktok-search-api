@@ -28,8 +28,9 @@ Real search responses are **HTTP-chunked, gzip'd, multi-object JSON streams**. T
 1. de-chunk, 2. gunzip, 3. split the concatenated top-level JSON objects, 4. take the object that has `data[]` / `search_item_list[]`.
 Request bodies are **protobuf**; `x-ss-stub = MD5(plaintext body)`.
 
-## Signer paths (two viable)
-- **Paid RapidAPI v46 signer** — what `rapid_signer.py` uses today. The vendored `tiktok_signer/` is a v37-era signer and **403s on v46** (keys frozen).
+## Signer paths
+- **Vendored pure-Python signer — the default** (`signer: local`). It DOES sign v46: `MetasecSigner.for_v46()` feeds it the `sign_*` params and attaches the warm identity, and `DEFAULT_SIGN_KEY` still holds because `mssdk_ver_code 83952160` is shared between the 37.x and 46.x builds. The old "403s on v46, keys frozen" verdict measured a real failure but named the wrong cause. Re-extracting the key from `libmetasec_ov.so` becomes necessary only when TikTok bumps the MSSDK.
+- **Paid RapidAPI v46 signer** (`rapid_signer.py`) — now the fallback for a hard signing failure, and the diagnostic for a stale local key.
 - **Free: Frida-hook the app's own native MSSDK signer** as a local RPC. Discover the class by enumerating `ms.bd*` / `com.ss.*` for the method signature `(int, int, long, String, Object)` — that's the argus entry point (libmetasec native).
 
 See also the tiktok-signing and identity-capture skills — this is their shared backdrop.

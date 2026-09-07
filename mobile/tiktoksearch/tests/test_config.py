@@ -1,9 +1,16 @@
 """Unit tests for config loading (no network, no identities file).
 
-Focus: the `RAPIDAPI_KEY` environment override added by the Docker epic — the key
-is no longer committed in a YAML profile, so `from_mapping` must resolve it from
-the environment while leaving every other field and the frozen-dataclass
-contract untouched.
+Two things:
+
+* the `RAPIDAPI_KEY` environment override added by the Docker epic — the key is
+  no longer committed in a YAML profile, so `from_mapping` must resolve it from
+  the environment while leaving every other field and the frozen-dataclass
+  contract untouched;
+* the `signer:` knob and `resolved_signer()` — which signer (and therefore which
+  request path) a profile runs. The derivation is a backwards-compat guarantee:
+  a profile that never mentions `signer:` must behave exactly as it did before
+  the knob existed, and a typo must be refused at the YAML boundary rather than
+  deriving silently onto the paid signer.
 
 Run:  cd mobile && ../.venv/bin/python -m pytest tiktoksearch/tests -q
 """
@@ -21,6 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tiktoksearch.config import (  # noqa: E402
     RAPIDAPI_KEY_ENV,
+    SIGNER_LEGACY,
+    SIGNER_LOCAL,
+    SIGNER_MODES,
+    SIGNER_RAPID,
     ClientConfig,
     PoolConfig,
 )
@@ -152,3 +163,151 @@ class TestClientConfigWithOverrides:
         slot = base.with_overrides({'not_a_field': 'x', 'device_id': 'dev-1'})
         assert slot.device_id == 'dev-1'
         assert not hasattr(slot, 'not_a_field')
+
+
+class TestResolvedSignerExplicit:
+    """An explicit `signer:` decides the mode outright."""
+
+    def test_each_mode_wins_over_the_derivation(self):
+        # `rapid`/`legacy` are asserted against the key state that would have
+        # DERIVED the other one, so a regression to the old
+        # `bool(rapidapi_key)` switch cannot pass.
+        assert ClientConfig(signer='local').resolved_signer() == SIGNER_LOCAL
+        assert ClientConfig(signer='rapid').resolved_signer() == SIGNER_RAPID
+        assert ClientConfig(
+            signer='legacy', rapidapi_key=FROM_YAML
+        ).resolved_signer() == SIGNER_LEGACY
+
+    def test_case_and_surrounding_whitespace_are_normalised(self):
+        raw = ('  LOCAL ', 'Rapid', '\tLEGACY\n', 'LoCaL')
+        assert [ClientConfig(signer=s).resolved_signer() for s in raw] == [
+            SIGNER_LOCAL, SIGNER_RAPID, SIGNER_LEGACY, SIGNER_LOCAL
+        ]
+
+    def test_explicit_local_is_not_overridden_by_the_env_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # The env override supplies the FALLBACK key; it must not silently move
+        # a profile onto the paid signer.
+        monkeypatch.setenv(RAPIDAPI_KEY_ENV, FROM_ENV)
+        cfg = ClientConfig.from_mapping({'signer': 'local'})
+        assert cfg.rapidapi_key == FROM_ENV
+        assert cfg.resolved_signer() == SIGNER_LOCAL
+
+    def test_every_mode_name_resolves_to_itself(self):
+        for mode in SIGNER_MODES:
+            assert ClientConfig(signer=mode).resolved_signer() == mode
+
+
+class TestResolvedSignerDerivation:
+    """Unset derives `rapid` if a key is configured, else `legacy` — the
+    backwards-compat guarantee for every profile that predates the knob."""
+
+    def test_unset_with_a_key_derives_rapid(self):
+        assert ClientConfig(rapidapi_key=FROM_YAML).resolved_signer() == SIGNER_RAPID
+
+    def test_unset_without_a_key_derives_legacy(self):
+        assert ClientConfig().resolved_signer() == SIGNER_LEGACY
+
+    def test_none_signer_is_unset(self):
+        # A bare `signer:` line in YAML parses as None.
+        assert ClientConfig(signer=None).resolved_signer() == SIGNER_LEGACY
+        assert ClientConfig(
+            signer=None, rapidapi_key=FROM_YAML
+        ).resolved_signer() == SIGNER_RAPID
+
+    def test_whitespace_only_signer_is_unset(self):
+        assert ClientConfig(signer='   ').resolved_signer() == SIGNER_LEGACY
+        assert ClientConfig(
+            signer='  \t ', rapidapi_key=FROM_YAML
+        ).resolved_signer() == SIGNER_RAPID
+
+    def test_from_mapping_stores_unset_as_empty_string(self):
+        for raw in ({'signer': None}, {}, {'signer': '   '}):
+            cfg = ClientConfig.from_mapping({**raw, 'rapidapi_key': FROM_YAML})
+            assert cfg.signer == ''
+            assert cfg.resolved_signer() == SIGNER_RAPID
+
+    def test_from_mapping_stores_the_normalised_mode(self):
+        assert ClientConfig.from_mapping({'signer': '  LoCaL  '}).signer == 'local'
+
+
+class TestSignerRejectedAtTheYamlBoundary:
+    """`resolved_signer()` DERIVES on anything it does not recognise, so a typo
+    has to be refused where YAML enters — otherwise `signer: locl` on a keyed
+    profile resolves to `rapid` and spends money on every request."""
+
+    def test_unknown_non_empty_value_raises(self):
+        for raw in ('locl', 'LOCAL_', 'rapidapi', 'x'):
+            with pytest.raises(ValueError):
+                ClientConfig.from_mapping({'signer': raw, 'rapidapi_key': FROM_YAML})
+
+    def test_rejection_names_the_offending_value_and_the_valid_modes(self):
+        with pytest.raises(ValueError) as excinfo:
+            ClientConfig.from_mapping({'signer': 'locl'})
+        message = str(excinfo.value)
+        assert 'locl' in message
+        for mode in SIGNER_MODES:
+            assert mode in message
+
+    def test_rejection_happens_through_pool_from_mapping_too(self):
+        with pytest.raises(ValueError):
+            PoolConfig.from_mapping({'signer': 'rapidapi', 'synthetic_devices': 1})
+
+    def test_a_directly_constructed_unknown_value_derives_rather_than_crashing(self):
+        # from_mapping is the only boundary; a hand-built config still resolves.
+        assert ClientConfig(signer='locl').resolved_signer() == SIGNER_LEGACY
+        assert ClientConfig(
+            signer='locl', rapidapi_key=FROM_YAML
+        ).resolved_signer() == SIGNER_RAPID
+
+
+class TestResolvedSignerIsPure:
+    def test_resolution_mutates_nothing(self):
+        cfg = ClientConfig(signer='  LOCAL ', rapidapi_key=FROM_YAML)
+        before = dataclasses.asdict(cfg)
+        assert cfg.resolved_signer() == SIGNER_LOCAL
+        assert cfg.resolved_signer() == SIGNER_LOCAL          # idempotent
+        assert dataclasses.asdict(cfg) == before
+        assert cfg.signer == '  LOCAL '                       # not normalised in place
+
+    def test_config_is_still_frozen_after_resolution(self):
+        cfg = ClientConfig(signer='local')
+        cfg.resolved_signer()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cfg.signer = SIGNER_RAPID
+
+
+class TestCommittedProfilesResolveAsDocumented:
+    """The three shipped profiles, loaded for real. This is what the
+    unset-derivation exists to protect: `config_signed.yaml` must stay on the
+    cold legacy path and `config_working.yaml` on the paid one, neither having
+    ever heard of `signer:`. Only the PRESENCE of a key is ever asserted."""
+
+    PROFILES = Path(__file__).resolve().parents[2]
+
+    def _defaults(self, name: str) -> ClientConfig:
+        return PoolConfig.load_yaml(str(self.PROFILES / name)).client_defaults
+
+    def test_config_signed_has_no_knob_and_stays_legacy(self):
+        cfg = self._defaults('config_signed.yaml')
+        assert not cfg.signer
+        # bool(), never the value: a failure here must not print a live key.
+        assert bool(cfg.rapidapi_key) is False
+        assert cfg.resolved_signer() == SIGNER_LEGACY
+
+    def test_config_working_has_no_knob_and_stays_rapid(self):
+        cfg = self._defaults('config_working.yaml')
+        assert not cfg.signer
+        assert bool(cfg.rapidapi_key) is True
+        assert cfg.resolved_signer() == SIGNER_RAPID
+
+    def test_config_direct_selects_local(self):
+        cfg = self._defaults('config_direct.yaml')
+        assert cfg.resolved_signer() == SIGNER_LOCAL
+
+    def test_config_direct_stays_local_with_the_env_key_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv(RAPIDAPI_KEY_ENV, FROM_ENV)
+        assert self._defaults('config_direct.yaml').resolved_signer() == SIGNER_LOCAL

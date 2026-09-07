@@ -7,6 +7,18 @@ DEFAULT_HOSTS: tuple[str, ...] = ('https://api16-normal-c-useast1a.tiktokv.com',
 # Env var that overrides the YAML `rapidapi_key`, so the key never has to be
 # committed in a config profile (see .env.example). Empty/unset falls back to YAML.
 RAPIDAPI_KEY_ENV = 'RAPIDAPI_KEY'
+# --- Signer modes (the `signer:` config knob) ---------------------------------
+# Which signer produces x-argus/x-gorgon/x-ladon/x-khronos, and therefore which
+# request path the client takes.
+#   local  — the vendored pure-Python MetasecSigner, fed the v46 `sign_*` params
+#            and the warm identity. Direct path, no paid quota.
+#   rapid  — the paid RapidAPI v46 signer. Direct path, as before.
+#   legacy — MetasecSigner on the v32 defaults with no identity: the cold path
+#            (api_hosts, count=20) that returns empty results by design.
+SIGNER_LOCAL = 'local'
+SIGNER_RAPID = 'rapid'
+SIGNER_LEGACY = 'legacy'
+SIGNER_MODES: frozenset[str] = frozenset((SIGNER_LOCAL, SIGNER_RAPID, SIGNER_LEGACY))
 
 @dataclass(frozen=True, slots=True)
 class ClientConfig:
@@ -39,6 +51,12 @@ class ClientConfig:
     # (/sign, url+device_model+headers body, tracks v46.0.3). Switch providers
     # when one's monthly quota is exhausted.
     rapidapi_provider: str = 'tiktanic'
+    # Which signer to use: one of SIGNER_MODES, or ''/None to derive it (see
+    # resolved_signer). Setting `signer: rapid` restores the paid path with no
+    # code change; `signer: local` is the default profile's choice. Optional
+    # like rapidapi_key: a bare `signer:` key in YAML parses as None, which
+    # from_mapping coerces to '' and resolved_signer treats as unset.
+    signer: str | None = ''
     search_host: str = 'https://search19-normal-alisg.tiktokv.com'
     # v46 signer params (must match the warm device's activated app version)
     sign_app_version: str = '46.0.42'
@@ -52,6 +70,23 @@ class ClientConfig:
     user_agent: str | None = None
     device_query: Mapping[str, Any] = field(default_factory=dict)
 
+    def resolved_signer(self) -> str:
+        """The signer mode this config actually runs, as one of SIGNER_MODES.
+
+        An explicit `signer:` wins. An empty value (unset, or a bare `signer:`
+        key) DERIVES the mode the way the client used to hard-code it — `rapid`
+        when a rapidapi_key is configured, else `legacy` — so a profile that
+        never mentions `signer:` behaves exactly as it did before the knob
+        existed. A value outside SIGNER_MODES cannot arrive from YAML
+        (`from_mapping` rejects it); reaching here it derives too, rather than
+        crashing a directly-constructed config.
+        `config_signed.yaml` (no key) depends on that: it must keep resolving to
+        the cold legacy path. Pure: the dataclass is frozen, nothing is stored."""
+        mode = self.signer.strip().lower() if self.signer else ''
+        if mode in SIGNER_MODES:
+            return mode
+        return SIGNER_RAPID if self.rapidapi_key else SIGNER_LEGACY
+
     @classmethod
     def _field_names(cls) -> frozenset[str]:
         return frozenset((f.name for f in fields(cls)))
@@ -62,6 +97,16 @@ class ClientConfig:
         data = {k: v for k, v in cfg.items() if k in known}
         if 'api_hosts' in data and data['api_hosts']:
             data['api_hosts'] = tuple(data['api_hosts'])
+        if 'signer' in data:
+            # Validated at the YAML boundary, because resolved_signer() DERIVES
+            # on anything it does not recognise: a typo like `signer: locl` on a
+            # profile that has a rapidapi_key would otherwise resolve silently to
+            # `rapid` and spend money on every request. A bare `signer:` (None)
+            # is a legitimate "unset" and coerces to ''.
+            mode = str(data['signer']).strip().lower() if data['signer'] is not None else ''
+            if mode and mode not in SIGNER_MODES:
+                raise ValueError(f'unknown signer {mode!r}: expected one of {sorted(SIGNER_MODES)}, or empty to derive it from rapidapi_key')
+            data['signer'] = mode
         env_key = os.environ.get(RAPIDAPI_KEY_ENV, '').strip()
         if env_key:
             data['rapidapi_key'] = env_key

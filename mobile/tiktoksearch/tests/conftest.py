@@ -1,6 +1,6 @@
-"""Shared scaffolding for the page_token regression net.
+"""Shared scaffolding for the page_token and local-signer regression nets.
 
-Three things live here, and nothing else:
+Four things live here, and nothing else:
 
 * **The no-network tripwire.** `requests.adapters.HTTPAdapter.send` is replaced
   for the whole session, so ANY test that reaches a real socket — TikTok or the
@@ -13,6 +13,11 @@ Three things live here, and nothing else:
 * **Canned TikTok replies + a stdlib ASGI driver.** `starlette.testclient`
   needs `httpx`, which is not a project dependency and is not worth adding for
   a test; the app is an ASGI callable, so it can be driven directly.
+* **Local-signer seams.** `MetasecSpy` stands in for the vendored `Metasec`
+  object so the params handed to it are observable, and `rapid_ledger` counts
+  paid-signer CONSTRUCTIONS. The local signer's crypto is in-process, so tests
+  may run it for REAL — that is a signature, not a request, and the tripwire
+  above still forbids anything leaving the process.
 
 Test modules import the helpers from here (`from conftest import reply`).
 Never reads `mobile/identities.json`: identity fixtures are synthetic temp
@@ -35,6 +40,7 @@ from requests.adapters import HTTPAdapter
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tiktoksearch import client as client_module  # noqa: E402
+from tiktoksearch.config import SIGNER_LOCAL, ClientConfig  # noqa: E402
 
 # A key-shaped placeholder: it only has to be truthy for `_direct` mode and to
 # get past RapidSigner's constructor guard. The signer class is stubbed out, so
@@ -44,6 +50,10 @@ STUB_SIGNER_KEY = 'stub-not-a-real-key'
 # satisfy IdentityStore, never TikTok.
 FAKE_COOKIE = 'sessionid=FAKE-COOKIE-1'
 FAKE_TOKEN = 'FAKE-X-TT-TOKEN'
+# Stands in for an identity's CAPTURED User-Agent. Synthetic, and deliberately
+# unlike the UA the signer builds itself, so the two are distinguishable.
+FAKE_UA = ('com.zhiliaoapp.musically/2024604020 (Linux; U; Android 13; en; '
+           'FAKE-DEV; Build/FAKE.000000.000)')
 
 
 # --------------------------------------------------------------- no network
@@ -100,6 +110,64 @@ def _stub_signer_and_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     """No real RapidSigner is ever constructed, and retries do not sleep."""
     monkeypatch.setattr(client_module, 'RapidSigner', FakeSigner)
     monkeypatch.setattr(client_module.time, 'sleep', lambda *_a, **_k: None)
+
+
+# ------------------------------------------------------- local-signer seams
+def local_config(**over) -> ClientConfig:
+    """A warm `signer: local` config, built from synthetic identity material.
+
+    Never derived from `mobile/identities.json`: fake device ids, a fake cookie
+    and a fake token. Pass `signer=SIGNER_LEGACY` to get the SAME warm material
+    on a legacy config — that is how the `_v46` gate gets tested on a config
+    that does carry an identity."""
+    base = dict(signer=SIGNER_LOCAL, cookie=FAKE_COOKIE, x_tt_token=FAKE_TOKEN,
+                user_agent=FAKE_UA, device_id='FAKE-DEV-1', iid='FAKE-IID-1',
+                device_query={'device_id': 'FAKE-DEV-1', 'iid': 'FAKE-IID-1'})
+    base.update(over)
+    return ClientConfig(**base)
+
+
+class MetasecSpy:
+    """Stands in for the vendored `Metasec` object a `MetasecSigner` holds.
+
+    Assigned over `signer._metasec`, it records the kwargs handed to `sign` —
+    which is the only place the v46-vs-v32 param mapping is observable, and
+    feeding v32 was the original bug — and optionally raises instead of
+    signing, to drive `_SIGNING_FAILURES`."""
+
+    def __init__(self, raises: BaseException | None = None) -> None:
+        self.seen: dict = {}
+        self.calls = 0
+        self.raises = raises
+
+    def sign(self, **kwargs) -> dict:
+        self.calls += 1
+        self.seen = dict(kwargs)
+        if self.raises is not None:
+            raise self.raises
+        return {'x-argus': 'A', 'x-ladon': 'L', 'x-gorgon': 'G', 'x-khronos': 1}
+
+
+@pytest.fixture
+def rapid_ledger(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Ledger of paid-signer CONSTRUCTIONS, one entry per `RapidSigner()`.
+
+    The narrow fallback is a money question, so the assertion has to be on the
+    receipt (0 constructions, or exactly 1) and not merely on which exception
+    came out. Replaces the autouse `FakeSigner`, so still nothing is signed for
+    real; headers it returns are tagged so a fallback signature is traceable."""
+    built: list = []
+
+    class CountingRapid(FakeSigner):
+        def __init__(self, config) -> None:  # noqa: ANN001
+            super().__init__(config)
+            built.append(self)
+
+        def sign(self, **kwargs) -> dict[str, str]:
+            return {**super().sign(**kwargs), 'x-signed-by': 'rapid-fallback'}
+
+    monkeypatch.setattr(client_module, 'RapidSigner', CountingRapid)
+    return built
 
 
 # ---------------------------------------------------- canned TikTok replies

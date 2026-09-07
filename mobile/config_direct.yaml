@@ -10,6 +10,24 @@ default_fan_out: 1
 # and the running API auto-reloads it — so an expired cookie/x-tt-token is
 # replaced without a restart. Falls back to `devices:` if the file is missing.
 identities_path: identities.json
+# Signer: `local` = the vendored pure-Python signer, fed the sign_* v46 params
+# below plus the identity's warm cookie/x-tt-token. It costs no quota and is the
+# default here. RapidAPI stays configured as a NARROW fallback: it re-signs only
+# when a local signing call HARD-FAILS (no headers produced at all), never for an
+# empty result (an empty is hit_shark identity distrust — refresh identities, do
+# not switch signers).
+#
+# The local signer's sign key is a static constant extracted from one
+# libmetasec_ov.so build, and TikTok can invalidate it by bumping the MSSDK. That
+# failure raises NOTHING and the fallback cannot see it: the signature stays
+# well-formed and risk-control answers HTTP 200 with an empty data[], i.e. it
+# looks exactly like expired credentials. The discriminator is that EVERY
+# identity goes stale at once, shortly after a TikTok app release — credentials
+# expire one device at a time. To confirm, set `signer: rapid` here (or on a copy
+# of this profile) and re-run the same query: results on rapid + empties on local
+# means the key is stale and must be re-extracted. That is one paid signature,
+# and it is the only signal that separates a stale key from stale identities.
+signer: local
 # From the RAPIDAPI_KEY env var / .env (see .env.example) — the env var wins.
 rapidapi_key:
 rapidapi_host: tiktok-api-signer.p.rapidapi.com

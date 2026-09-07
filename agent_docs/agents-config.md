@@ -8,7 +8,7 @@ Single source of project-specific commands, versions, and conventions. Every age
 - **Web framework:** FastAPI + Uvicorn (ASGI). App factory: `mobile/tiktoksearch/api/app.py` `create_app(config_path)`.
 - **HTTP client:** `requests` (with `requests[socks]` for SOCKS proxies)
 - **Config:** YAML (`PyYAML`) → frozen `dataclass` (`config.py`). Config is immutable; overrides via `replace()`.
-- **Crypto (vendored signer):** `pycryptodome`, `gmssl` (used by `tiktok_signer/` — the vendored pure-Python signer, largely superseded by the RapidAPI signer)
+- **Crypto (vendored signer):** `pycryptodome`, `gmssl` (used by `tiktok_signer/` — the vendored pure-Python signer, which is the **default** signer via `signer: local`; it signs v46 in-process at zero quota)
 - **Domain:** TikTok mobile search via signed direct-API requests. No official API — this is a reverse-engineering / anti-bot-evasion problem. See `architecture.md`.
 
 ## Commands
@@ -25,13 +25,29 @@ Single source of project-specific commands, versions, and conventions. Every age
 ## Test framework
 
 - **pytest**, tests live in `mobile/tiktoksearch/tests/`. Class-based grouping (`class TestX:`), plain `assert`, `pytest.raises` for error cases.
-- Network- and emulator-dependent code (client search, RapidAPI signer, capture addon) is NOT covered by the automated suite — those require live identities/proxies/emulator. Test pure logic (config parsing, filters, identity health/reload, mapping, pagination dedup) with fakes; never hit TikTok or RapidAPI in a unit test.
+- Network- and emulator-dependent code (the live client search, the RapidAPI signer, the capture addon) is NOT covered by the automated suite — it needs live identities/proxies/emulator. Test pure logic (config parsing, filters, identity health/reload, mapping, pagination dedup, token round-trips) with fakes; never hit TikTok or RapidAPI in a unit test.
+- `tests/conftest.py` installs a session-scoped `HTTPAdapter.send` tripwire that **fails the run** if any test reaches the network, so a test can never spend signer quota. The local signer's crypto runs in-process, so `signer: local` paths are testable without stubbing the signature itself.
 
 ## Config files (three signer profiles)
 
-- `mobile/config_direct.yaml` — **primary.** RapidAPI `tiktanic` signer + warm identities + IdentityStore (`identities_path`). This is the working direct-API path.
-- `mobile/config_working.yaml` — RapidAPI `working` signer (alternate provider, switch when tiktanic quota exhausted).
-- `mobile/config_signed.yaml` — vendored MetasecSigner + synthetic devices. Cold/legacy; returns empty (v46 risk-control rejects v37-era argus). Do not use for real results.
+- `mobile/config_direct.yaml` — **primary.** `signer: local` (vendored signer, zero quota) + warm identities + IdentityStore (`identities_path`). This is the working direct-API path.
+- `mobile/config_working.yaml` — no `signer:`, carries a key → derives `rapid` with the `working` provider (alternate paid provider; switch when tiktanic quota is exhausted).
+- `mobile/config_signed.yaml` — no `signer:`, no key → derives `legacy` + synthetic devices. Returns empty **because `legacy` signs with the v32 params and attaches no warm identity**, not because the vendored signer cannot do v46. Do not use for real results.
+
+## The `signer:` knob (`ClientConfig.resolved_signer()`)
+
+The signer and the direct-API path are separate concerns — `_direct` is no longer "has a RapidAPI key".
+
+| `signer:` | Signer | Path | Quota |
+|---|---|---|---|
+| `local` | vendored, via `MetasecSigner.for_v46()` (maps `sign_*` onto the four fields `Metasec.sign` reads, attaches the warm identity) | direct | **free** |
+| `rapid` | `RapidSigner` | direct | paid, 1+ per request |
+| `legacy` | vendored on the v32 defaults, no identity | old cold path (`api_hosts`, `count=20`) | free, empty by design |
+| *unset* | `rapid` if `rapidapi_key` else `legacy` | — | preserves pre-knob behaviour |
+
+- `from_mapping` **rejects** an unknown non-empty value (a `signer: locl` typo would otherwise derive to `rapid` and bill every request). Startup logs the resolved mode **and** the raw value.
+- The RapidAPI fallback fires only on a hard signer-level `TransportError` in `local` mode, never on an empty/`hit_shark` — see `.claude/rules/lessons/anti-block.md`.
+- **A stale local sign key is silent and looks exactly like expired credentials.** Diagnose by flipping one profile to `signer: rapid` and re-running the same query; that single paid signature is the only separating signal.
 
 ## File-size norm
 

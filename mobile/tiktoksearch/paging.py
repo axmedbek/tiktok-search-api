@@ -96,13 +96,19 @@ _B64_BLOCK = 4
 # with no way for anyone to notice, which is a worse failure than a slightly
 # larger opaque token.
 #
-# The window is measured in RECORDS, not pages: 60 x 4 covers four pages only
-# at the shipped `max_results_per_search` of 60. A profile that raises that cap
-# keeps the same 240 fingerprints and so silently narrows the coverage to fewer
-# pages (two, at a 120-record page) — raise `_WINDOW_PAGES` alongside such a
-# profile change, or accept that records older than 240 can be re-emitted. The
-# entries that fall off the back are, at the shipped size, the ones neither
-# endpoint can still re-emit anyway.
+# The window is bounded in RECORDS, not pages, so its PAGE coverage scales
+# inversely with the caller's `limit`: 240 fingerprints span 8 pages at
+# `limit=30`, 4 at the shipped `max_results_per_search` of 60, and 2 at a
+# 120-record page on a profile that raises that cap.
+#
+# A record older than the window CAN be re-emitted and will NOT be caught —
+# TikTok demonstrably re-serves one many pages later. Measured on a live 15-page
+# user-search chain: 421 records with 2 duplicate emissions, the two ids
+# re-served at 240 and 300 records' distance, i.e. exactly after falling off the
+# back. Cross-page dedup is therefore exact only within the trailing window; a
+# caller needing global uniqueness over a deep stream dedupes on its own side.
+# Widening the window (raising `_WINDOW_PAGES`) trades token size for coverage
+# and is a deliberate decision, not a fix for those duplicates.
 FINGERPRINT_BYTES = 4
 _PAGE_RECORD_BUDGET = 60
 _WINDOW_PAGES = 4

@@ -6,7 +6,7 @@ import urllib.parse
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 import requests
-from .config import ClientConfig
+from .config import SIGNER_LOCAL, SIGNER_RAPID, ClientConfig
 from .errors import RateLimited, SoftError, TransportError
 from .filters import SearchKind, SearchPage, SearchQuery
 from .mapping import flatten_user, flatten_video
@@ -134,15 +134,23 @@ class TikTokClient:
 
     def __init__(self, config: ClientConfig, *, signer: Optional[MetasecSigner]=None) -> None:
         self._config = config
-        self._direct = bool(config.rapidapi_key)
+        # The signer mode decides BOTH which signer signs and which request path
+        # runs. These were one switch (`bool(config.rapidapi_key)`) before, which
+        # is why the paid signer had a monopoly on the working direct path.
+        self._mode = config.resolved_signer()
+        self._direct = self._mode in (SIGNER_LOCAL, SIGNER_RAPID)
         dq = config.device_query or {}
         self.device_id = config.device_id or dq.get('device_id') or _synth_id()
         self.iid = config.iid or dq.get('iid') or _synth_id()
         self.proxy = config.proxy
-        if self._direct:
+        if self._mode == SIGNER_RAPID:
             self._signer = RapidSigner(config)
+        elif self._mode == SIGNER_LOCAL:
+            self._signer = signer or MetasecSigner.for_v46(config)
         else:
             self._signer = signer or MetasecSigner(config)
+        # Lazily built, and only ever by _rapid_fallback.
+        self._fallback: Optional[RapidSigner] = None
         self._session = requests.Session()
         if config.proxy:
             self._session.proxies = {'http': config.proxy, 'https': config.proxy}
@@ -372,6 +380,49 @@ class TikTokClient:
             return params
         return {'aid': str(cfg.app_id), 'app_name': 'musical_ly', 'version_code': cfg.version_code, 'version_name': cfg.app_version, 'device_platform': 'android', 'device_type': cfg.device_type, 'os_version': cfg.os_version, 'ssmix': 'a', 'device_id': self.device_id, 'iid': self.iid, 'channel': cfg.channel}
 
+    def _rapid_fallback(self, exc: TransportError) -> RapidSigner:
+        """The paid signer to re-sign ONE failed local signing call with.
+
+        Reached from exactly one place: `_sign`'s `except TransportError`, i.e.
+        a HARD signing failure — the local signer produced no headers at all
+        (a malformed URL, a signature reply missing a header, a crypto helper
+        blowing up). Nothing else may reach it, and that is the whole coverage.
+
+        It does NOT cover a stale sign key. An MSSDK bump raises nothing: the
+        local signer keeps producing a well-formed signature that risk-control
+        answers with HTTP 200 and an empty `data[]`, which arrives as
+        `SoftError` — the one class this fallback must refuse, because swapping
+        signers for an empty answer to a VALID signature is precisely the
+        misdiagnosis `.claude/rules/lessons/anti-block.md` forbids. A stale key
+        is diagnosed by hand instead (every identity failing at once shortly
+        after a TikTok release; confirm by flipping one profile to
+        `signer: rapid`), not papered over here.
+
+        With no `rapidapi_key` configured there is nothing to fall back to, so
+        the failure is logged and re-raised rather than silently retried."""
+        if not self._config.rapidapi_key:
+            logger.error('local signer failed and no RapidAPI fallback is configured: %s', exc)
+            raise exc
+        if self._fallback is None:
+            # Once per client: the local signer is still tried first on every
+            # later request, so a recovered local path stops spending quota.
+            logger.warning('local signer failed (%s) — falling back to the RapidAPI signer', exc)
+            self._fallback = RapidSigner(self._config)
+        return self._fallback
+
+    def _sign(self, url: str) -> dict[str, str]:
+        """Headers for one signed request, from whichever signer this client
+        holds. The direct path passes `iid`; the cold legacy path does not."""
+        if not self._direct:
+            return self._signer.sign(url=url, device_id=self.device_id)
+        try:
+            return self._signer.sign(url=url, device_id=self.device_id, iid=self.iid)
+        except TransportError as exc:
+            if self._mode != SIGNER_LOCAL:
+                # Already on RapidAPI: there is nowhere narrower to fall back to.
+                raise
+            return self._rapid_fallback(exc).sign(url=url, device_id=self.device_id, iid=self.iid)
+
     def _get_signed(self, path: str, params: dict, *, has_session: bool=False) -> dict:
         """Sign and perform one search request.
 
@@ -390,10 +441,7 @@ class TikTokClient:
             else:
                 host = cfg.api_hosts[attempt % len(cfg.api_hosts)]
             url = host + path + '?' + urllib.parse.urlencode(params)
-            if self._direct:
-                headers = self._signer.sign(url=url, device_id=self.device_id, iid=self.iid)
-            else:
-                headers = self._signer.sign(url=url, device_id=self.device_id)
+            headers = self._sign(url)
             try:
                 resp = self._session.get(url, headers=headers, timeout=cfg.request_timeout_s)
             except requests.RequestException as exc:

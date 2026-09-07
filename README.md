@@ -36,7 +36,7 @@ pip install -r requirements.txt
 ### With Docker (API + demo UI)
 
 ```bash
-cp .env.example .env          # then put your RapidAPI signer key in it
+cp .env.example .env          # RAPIDAPI_KEY is OPTIONAL under the default signer: local
 docker compose up -d --build
 docker compose logs -f api    # expect: "Signed search API up. N device(s) …"
 ```
@@ -47,7 +47,7 @@ docker compose logs -f api    # expect: "Signed search API up. N device(s) …"
 | `http://localhost:8080` | the demo UI (`mobile/demo.html`, served by nginx) |
 
 Both ports bind **loopback only**. `/search` has no authentication, signs with a
-live warm identity and spends paid signer quota, and the services are
+live warm identity, and the services are
 `restart: unless-stopped` — so they are deliberately not published on all
 interfaces. For remote access put a tunnel in front:
 `cloudflared tunnel --url http://127.0.0.1:8000`, then point the UI at it with
@@ -59,9 +59,12 @@ The whole directory is mounted, not individual files, so the capture loop's
 atomic `os.replace()` of `identities.json` stays visible to the container and
 hot-reload keeps working.
 
-> If `RAPIDAPI_KEY` is unset and the profile's `rapidapi_key:` is blank, startup
-> logs a loud `ERROR` and searches return **empty** — that is configuration, not
-> `hit_shark`. Check `docker compose logs api` first.
+> The default profile uses `signer: local` — the vendored signer signs v46
+> in-process at **zero** signer quota, so an unset `RAPIDAPI_KEY` is the normal
+> working state. RapidAPI is kept for two jobs: re-signing a hard local signing
+> failure, and diagnosing a stale local sign key (flip a profile to
+> `signer: rapid` and re-run the same query). Startup logs the resolved mode —
+> check `docker compose logs api` first if results surprise you.
 
 ### Natively
 
@@ -71,8 +74,10 @@ python mobile/api_signed.py --config mobile/config_direct.yaml --port 8000
 uvicorn mobile.api_signed:app --port 8000     # uses $TTAPI_SIGNED_CONFIG
 ```
 
-The service starts with **5 synthetic device identities** by default (see config),
-giving 1500 searches/day of capacity — enough to try everything immediately.
+`config_direct.yaml` serves from its warm device identity (or from
+`identities.json` when the capture loop has written one), with a per-device cap
+of 500 searches/day. `config_signed.yaml` is the cold `legacy` profile and
+returns empty by design — don't use it for real results.
 
 **Check it's up:**
 
@@ -117,42 +122,53 @@ curl -X POST localhost:8000/search \
 - `sort_type`: `"0"` relevance (default) · `"1"` most liked
 - `publish_time`: `"0"` all · `"1"` 24h · `"7"` week · `"30"` month · `"90"` 3 months · `"180"` 6 months
 
-### Pagination
+### Pagination — pass `page_token` back, never `next_cursor`
 
-Every response returns `next_cursor` and `has_more`. Start with `cursor: 0`
-(or omit it), then resend with `cursor` set to the previous `next_cursor`:
+TikTok's search is a **session**: a request at a non-zero offset must echo the
+previous reply's `search_id`, or the API answers `empty_session` and returns
+nothing. So resend the response's `page_token`; feeding `next_cursor` back as
+`cursor` is a sessionless request and comes back `502 empty_session`.
 
 ```bash
 # page 1
 curl -X POST localhost:8000/search -H 'content-type: application/json' \
-  -d '{ "type": "keyword", "query": "cats", "limit": 20 }'          # -> next_cursor: 20
+  -d '{ "type": "keyword", "query": "cats", "limit": 20 }'
+# -> { "count": 20, "next_cursor": 20, "has_more": true, "page_token": "eyJ2Ijox…" }
 
-# page 2
+# page 2 — the token is the only thing that changes
 curl -X POST localhost:8000/search -H 'content-type: application/json' \
-  -d '{ "type": "keyword", "query": "cats", "limit": 20, "cursor": 20 }'
+  -d '{ "type": "keyword", "query": "cats", "limit": 20, "page_token": "eyJ2Ijox…" }'
 ```
 
-Stop when `has_more` is `false`. (How deep paging goes depends on the device
-identity — synthetic ids get a shallow window; real device ids + proxies unlock
-more, with no code change. See the API reference.)
+Stop when `page_token` comes back `null`; the end of a stream is a normal `200`
+with `count: 0`, not an error. `next_cursor` is TikTok's own cursor and is
+informational only. `cursor` is still accepted for backwards compatibility.
+
+Notes: the token pins the device that served the previous page, so an explicit
+`fan_out > 1` alongside it is a `422`. Tokens are authenticated and do not
+survive a server restart (a stale one is a `422`, not a resumable session).
+Cross-page dedup covers a bounded window of recent records, so a repeat is
+possible only far deeper than a stream normally goes.
 
 ### Results per search (fan-out)
 
-TikTok gives each synthetic device only ~10 results per call. To return more, the
-API queries several devices in parallel and merges/dedupes them — a plain request
-already returns **~30+** (server `default_fan_out: 6`). Override per request:
+TikTok returns ~10 results per call per device. `fan_out` queries several
+devices in parallel and merges/dedupes them, at one daily-cap unit per device.
+`config_direct.yaml` ships `default_fan_out: 1`, because a merged page spans
+several devices and therefore cannot mint a `page_token` — fan-out and
+pagination are alternatives, not companions.
 
 ```bash
-# ~30+ results (default) — no extra params needed
+# deeper results from one device: paginate with page_token (above)
 curl -X POST localhost:8000/search -d '{"type":"keyword","query":"cats","limit":60}'
 
-# cheapest, single device (~10)
-curl -X POST localhost:8000/search -d '{"type":"keyword","query":"cats","fan_out":1}'
+# wider results in one call: fan out across the pool (no page_token)
+curl -X POST localhost:8000/search -d '{"type":"keyword","query":"cats","fan_out":8}'
 ```
 
-Each `fan_out` unit spends one device's daily budget. Returns diminish past ~6
-(popular queries repeat across devices). Real device ids return hundreds each —
-then set `default_fan_out: 1`.
+`fan_out` is capped at the pool size, so it only helps once the pool holds
+several warm identities. Returns diminish past ~6 as popular queries repeat
+across devices.
 
 ### Hashtag search (the `#` is optional)
 
@@ -176,11 +192,12 @@ curl -X POST localhost:8000/search \
 {
   "query": "climate change",
   "type": "keyword",
-  "device": "syn0",
+  "device": "dev0",
   "count": 18,
   "cursor": 0,
   "next_cursor": 20,
   "has_more": true,
+  "page_token": "eyJ2IjoxLCJxIjoi…",
   "elapsed_s": 2.4,
   "results": [
     {
@@ -209,7 +226,7 @@ curl -X POST localhost:8000/search \
 | Code | Meaning |
 |------|---------|
 | `200` | Success (`results` may be empty). |
-| `422` | Bad body (invalid enum, empty query, or filters on a user search). |
+| `422` | Bad body (invalid enum, empty query, filters on a user search), or a rejected `page_token` (malformed, tampered, minted for another query, from a previous server run, or combined with a non-zero `cursor` / an explicit `fan_out > 1`). |
 | `429` | Daily cap reached on all devices, or TikTok rate-limited. |
 | `502` | TikTok rejected/failed the request. |
 | `503` | All devices busy past the acquire timeout. |

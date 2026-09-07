@@ -25,7 +25,7 @@ Confirm the identity in use has a real `sessionid` cookie **and** `x_tt_token`. 
 No/bad proxy (datacenter IP, wrong geo) triggers `hit_shark` even with warm creds. Confirm the identity has a residential proxy bound.
 
 **(5) Signer — only after identity is ruled out.**
-Inspect the signing path last: `rapid_signer.py`, the version match (`sign_app_version` must be **v46**), and endpoint + query params (`single/` + `search/item/`, `offset`/`search_id`/`count`). A v37-era argus against v46 risk-control returns empty — but this is a version/config issue, not a reason to churn signers.
+Inspect the signing path last: the resolved mode (`signer: local | rapid | legacy` — startup logs it), the version match (`sign_app_version` must be **v46**, and a `local` identity needs its captured `user_agent` or the built UA quotes `version_code=320904` against a v46 signature), and endpoint + query params (`single/` + `search/item/`, `offset`/`search_id`/`count`). A version-mismatched argus against v46 risk-control returns empty — a version/config issue, not a reason to churn signers. One case does warrant the paid signer: if *every* identity fails at once shortly after a TikTok release, the static local sign key may be stale — flip one profile to `signer: rapid` and re-run the same query. That single paid signature is the only signal separating a stale key from expired credentials.
 
 ## Output
 
