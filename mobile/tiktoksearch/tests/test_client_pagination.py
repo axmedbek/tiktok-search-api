@@ -33,11 +33,13 @@ from tiktoksearch.client import (  # noqa: E402
     MAX_PAGES_PER_ENDPOINT,
     NIL_EMPTY_SESSION,
     NIL_FEDERATION_EMPTY,
+    PAGE_BUDGET_SLACK_PAGES,
     SEARCH_ITEM_PATH,
     SEARCH_USER_PATH,
     SEARCH_VIDEO_PATH,
     PageProgress,
     TikTokClient,
+    _page_budget,
     _prefer_failure,
 )
 from tiktoksearch.config import ClientConfig  # noqa: E402
@@ -64,6 +66,9 @@ RETRIES = 2
 ATTEMPTS = RETRIES + 1
 SESSION_ID = 'SIDP'
 STORED_CURSOR = 30
+# `client._paginate_into`'s own `page_count` in direct mode — count=20 makes
+# TikTok answer has_more=false early, so the direct path paginates at 10.
+DIRECT_PAGE_COUNT = 10
 
 
 def _client(**over) -> TikTokClient:
@@ -308,17 +313,54 @@ class TestLoopTermination:
         assert end.cursor == 10        # clamped, never rewound to 5
         assert end.has_more is False
 
-    def test_the_page_ceiling_backstops_a_stream_that_only_repeats_itself(
+    def test_the_page_budget_stops_a_stream_that_only_repeats_itself(
             self, transport):
         # Cursor advances every page, so the guard cannot fire; every page
-        # re-serves ids the dedup window already holds.
+        # re-serves ids the dedup window already holds. The stream must still
+        # terminate — an unbounded loop here is one signed request per
+        # iteration — but the budget bounds THIS REQUEST's work, and that is
+        # not evidence the endpoint is spent.
         transport.script(lambda call: reply(range(1, 11),
                                             cursor=int(call['offset']) + 10,
                                             has_more=True))
         out, end = _drive(_client(), limit=100)
-        assert len(transport.calls) == MAX_PAGES_PER_ENDPOINT
-        assert end.has_more is False
+        assert _page_budget(100, DIRECT_PAGE_COUNT) == 10 + PAGE_BUDGET_SLACK_PAGES
+        assert len(transport.calls) == _page_budget(100, DIRECT_PAGE_COUNT)
         assert len(out) == 10
+        # NOT retired: TikTok's own has_more is kept, so a page_token can
+        # resume this endpoint. Writing has_more=False here is what made a
+        # bigger `limit` return FEWER records than a smaller one.
+        assert end.has_more is True
+        assert end.cursor == 10 * len(transport.calls)
+
+    def test_the_budget_scales_with_limit_so_a_bigger_limit_reaches_further(
+            self, transport):
+        # The regression this replaces a fixed ceiling for: under a flat
+        # 12-page ceiling every limit above 120 spent the SAME 12 pages and
+        # then retired the endpoint, so limit=300 got less than limit=30.
+        transport.script(lambda call: reply(
+            range(int(call['offset']) + 1, int(call['offset']) + 11),
+            cursor=int(call['offset']) + 10, has_more=True))
+        small, _ = _drive(_client(), limit=30)
+        small_calls = len(transport.calls)
+        transport.calls.clear()
+        big, big_end = _drive(_client(), limit=300)
+        assert (len(small), small_calls) == (30, 3)
+        assert (len(big), len(transport.calls)) == (300, 30)
+        assert big_end.has_more is True
+
+    def test_the_absolute_backstop_bounds_work_whatever_limit_asks_for(
+            self, transport):
+        # `limit` is caller input, so the budget alone cannot bound cost.
+        transport.script(lambda call: reply(
+            range(int(call['offset']) + 1, int(call['offset']) + 11),
+            cursor=int(call['offset']) + 10, has_more=True))
+        out, end = _drive(_client(), limit=100_000)
+        assert len(transport.calls) == MAX_PAGES_PER_ENDPOINT
+        assert len(out) == MAX_PAGES_PER_ENDPOINT * DIRECT_PAGE_COUNT
+        # Still a pause, not a retirement — the backstop is a cost bound, and
+        # the caller can keep going with the token it gets.
+        assert end.has_more is True
 
     def test_a_normally_advancing_stream_walks_the_offsets(self, transport):
         pages = {'0': reply(range(1, 11), cursor=10, has_more=True),

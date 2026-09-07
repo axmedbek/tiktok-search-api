@@ -200,10 +200,18 @@
         </select>
       </label>
       <label>Limit
+        <!-- Server sərhədi 300 (max_results_per_search). Böyük limit bütün
+             yığımı BİR sorğuda edir: cihaz slotu sorğu bitənə qədər tutulur
+             (acquire_timeout_s: 60 → paralel sorğu 503 ala bilər) və nəticələr
+             yalnız sonda görünür, ona görə default ən kiçik variantdır.
+             250-də bir incəlik var: token yalnız 240 barmaq izi daşıyır, yəni
+             bir sorğuda verilən 250 nəticənin ən köhnə ~10-u növbəti səhifədə
+             təkrar gələ bilər (bir sorğunun İÇİNDƏ dedup dəqiqdir). -->
         <select id="limit">
-          <option value="20">20</option>
-          <option value="40" selected>40</option>
-          <option value="60">60</option>
+          <option value="120" selected>120</option>
+          <option value="180">180</option>
+          <option value="200">200</option>
+          <option value="250">250</option>
         </select>
       </label>
     </div>
@@ -364,7 +372,7 @@ document.querySelectorAll(".vt").forEach(v=>{
 let pageToken = null, accResults = [], startedAt = 0;
 
 function buildBody(q, token){
-  const body = {type:kind, query:q, limit:parseInt($("#limit").value,10)||40};
+  const body = {type:kind, query:q, limit:parseInt($("#limit").value,10)||120};
   if(token) body.page_token = token;
   if(kind!=="user"){
     const st=$("#sort_type").value, pt=$("#publish_time").value, f={};

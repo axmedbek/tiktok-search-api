@@ -1,6 +1,6 @@
 daily_request_cap_per_device: 500
 acquire_timeout_s: 60
-max_results_per_search: 60
+max_results_per_search: 300
 request_timeout_s: 25
 retries: 2
 default_fan_out: 1

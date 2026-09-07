@@ -98,8 +98,11 @@ _B64_BLOCK = 4
 #
 # The window is bounded in RECORDS, not pages, so its PAGE coverage scales
 # inversely with the caller's `limit`: 240 fingerprints span 8 pages at
-# `limit=30`, 4 at the shipped `max_results_per_search` of 60, and 2 at a
-# 120-record page on a profile that raises that cap.
+# `limit=30`, 2 at `limit=120`, and less than one whole page at `limit=250` —
+# there the token carries 240 of the 250 served, so the oldest ~10 records drop
+# out and can legitimately reappear on the next page. In-request dedup is
+# unaffected and exact at any size: nothing is ever evicted while a request
+# runs, only `recent()` trims on the way into the token.
 #
 # A record older than the window CAN be re-emitted and will NOT be caught —
 # TikTok demonstrably re-serves one many pages later. Measured on a live 15-page

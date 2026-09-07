@@ -40,10 +40,22 @@ NIL_FEDERATION_EMPTY = 'federation_empty'
 # SoftError (502) — anti-block invariants (a) and (b). Adding a value here is
 # a deliberate decision to stop counting that shape against identity health.
 _TAIL_NILS: frozenset[str] = frozenset((NIL_EMPTY_SESSION, NIL_FEDERATION_EMPTY))
-# Backstop on one endpoint's inner loop. Every iteration is a PAID signed
-# request, so a misbehaving upstream must not be able to spin here even if the
-# cursor guard is somehow satisfied.
-MAX_PAGES_PER_ENDPOINT = 12
+# How many pages ONE request may spend on ONE endpoint, on top of the
+# `ceil(limit / page_count)` it strictly needs. Slack, because a page of
+# `page_count` raw items rarely yields `page_count` NEW records: the two video
+# endpoints overlap heavily and the shared dedup window drops the repeats, so a
+# budget of exactly the arithmetic minimum would systematically under-fill
+# `limit`.
+PAGE_BUDGET_SLACK_PAGES = 4
+# Absolute backstop on one endpoint's inner loop, whatever `limit` asks for.
+# Every iteration is a signed request against a live warm identity (and a paid
+# one in `signer: rapid`), so a misbehaving upstream must not be able to spin
+# here even if the cursor guard is somehow satisfied, and a caller must not be
+# able to buy unbounded work by naming a huge `limit`. Sized to sit just above
+# the largest budget the shipped profile can ask for — `max_results_per_search:
+# 300` at `page_count=10` needs 30 pages plus slack — so on that profile this
+# bound is a safety net, not the thing that stops a normal stream.
+MAX_PAGES_PER_ENDPOINT = 40
 _ID_LO = 7000000000000000000
 _ID_HI = 7499999999999999999
 
@@ -93,6 +105,19 @@ def _as_cursor(value: object, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return cursor if cursor >= 0 else fallback
+
+def _page_budget(limit: int, page_count: int) -> int:
+    """How many pages one request may spend on one endpoint.
+
+    Proportional to what `limit` actually needs (`ceil(limit / page_count)`)
+    plus `PAGE_BUDGET_SLACK_PAGES`, and never past `MAX_PAGES_PER_ENDPOINT`.
+    Proportionality is the whole point: a fixed page count is a bound on WORK
+    that pretends to be a bound on USEFULNESS, and it silently inverts the
+    caller's request once `limit` exceeds what those pages can carry — a bigger
+    `limit` then returns FEWER records than a smaller one."""
+    needed = -(-limit // page_count)
+    return min(needed + PAGE_BUDGET_SLACK_PAGES, MAX_PAGES_PER_ENDPOINT)
+
 
 def _prefer_failure(current: Optional[Exception], exc: Optional[Exception]) -> Optional[Exception]:
     """Which failure to re-raise once every endpoint has been attempted and
@@ -281,21 +306,32 @@ class TikTokClient:
         # direct mode paginates deeper with count=10 (count=20 returns has_more=false early)
         page_count = 10 if self._direct else 20
         pages = 0
+        budget = _page_budget(limit, page_count)
         while len(out) < limit:
-            if pages >= MAX_PAGES_PER_ENDPOINT:
-                # An endpoint that burned this many PAID signs without
-                # filling `limit` is retired rather than left resumable, and
-                # the cost of that is real: retiring it can end the whole
-                # stream. Measured — 21 records against limit=60, the general
-                # endpoint marked has_more=False at cursor=120 while TikTok
-                # itself still said has_more=true, and no page_token minted at
-                # all. Accepted because reaching the ceiling takes 12 pages at
-                # a ~90% duplicate rate against a 12-page dedup window, i.e. an
-                # endpoint that is re-serving what the stream already holds.
-                logger.warning('page ceiling %d reached on %s — stopping', MAX_PAGES_PER_ENDPOINT, path)
-                has_more = False
-                if progress is not None:
-                    progress.has_more = False
+            if pages >= budget:
+                # "Enough work for THIS request", not "this endpoint is spent".
+                # The two used to be one thing: a flat 12-page ceiling that
+                # also wrote has_more=False, retiring an endpoint TikTok was
+                # still willing to serve. That was defensible only while
+                # `limit <= page_count * ceiling` — the reasoning was "12 pages
+                # that failed to fill `limit` are re-serving what the stream
+                # already holds", which is a statement about a full window and
+                # is simply false once `limit` exceeds what 12 pages can carry.
+                # Measured on the old flat ceiling: limit=60 returned 105
+                # unique records over 2 requests where limit=30 chained to 267,
+                # because the general endpoint was marked has_more=False at
+                # cursor=120 while TikTok itself still said has_more=true, and
+                # no page_token was minted at all. At limit=300 it would have
+                # fired on the very first request.
+                #
+                # So the budget only ENDS THIS REQUEST. `has_more` keeps
+                # TikTok's own value from the last successful page (and
+                # `progress` already published it), so the endpoint stays
+                # resumable and the minted page_token continues it. Retirement
+                # is left to the three cases where it is actually true:
+                # TikTok's own has_more=false, a cursor that does not advance,
+                # and an allow-listed session tail.
+                logger.info('page budget %d spent on %s at cursor %d (limit %d, kept %d) — pausing, endpoint stays resumable (has_more=%s)', budget, path, cursor, limit, len(out), has_more)
                 break
             pages += 1
             prev_cursor = cursor
