@@ -344,7 +344,7 @@ function render(){
     return;
   }
   let html = lastData.results.map(card).join("");
-  if(cursor!=null){
+  if(pageToken){
     html += `<div class="morebar"><button class="more" id="more">Daha çox yüklə ↓</button></div>`;
   }
   box.innerHTML = html;
@@ -359,10 +359,13 @@ document.querySelectorAll(".vt").forEach(v=>{
 });
 
 /* ---- search + pagination ---- */
-let cursor = 0, accResults = [], startedAt = 0;
+/* pageToken carries TikTok's cursor + search_id session — a bare cursor comes
+   back empty (empty_session), so "daha çox" always sends the token. */
+let pageToken = null, accResults = [], startedAt = 0;
 
-function buildBody(q, cur){
-  const body = {type:kind, query:q, limit:parseInt($("#limit").value,10)||40, cursor:cur||0};
+function buildBody(q, token){
+  const body = {type:kind, query:q, limit:parseInt($("#limit").value,10)||40};
+  if(token) body.page_token = token;
   if(kind!=="user"){
     const st=$("#sort_type").value, pt=$("#publish_time").value, f={};
     if(st) f.sort_type=st; if(pt) f.publish_time=pt;
@@ -382,9 +385,9 @@ function renderMeta(d){
   $("#meta").innerHTML = parts.join("");
 }
 
-async function fetchPage(q, cur){
+async function fetchPage(q, token){
   const r = await fetch(API+"/search",{method:"POST",headers:{"content-type":"application/json"},
-    body:JSON.stringify(buildBody(q, cur))});
+    body:JSON.stringify(buildBody(q, token))});
   let d; try{ d = await r.json(); }catch{ d = {}; }
   if(!r.ok){ const err = new Error(d.detail || (r.status+" "+r.statusText)); err.status=r.status; throw err; }
   return d;
@@ -404,12 +407,12 @@ function showError(e){
 async function search(){
   const q = $("#q").value.trim(); if(!q) return;
   banner(null);
-  $("#go").disabled=true; lastData=null; accResults=[]; cursor=0;
+  $("#go").disabled=true; lastData=null; accResults=[]; pageToken=null;
   $("#results").innerHTML=""; $("#meta").innerHTML = `<span class="chip"><span class="spin"></span> axtarılır…</span>`;
   try{
-    const d = await fetchPage(q, 0);
+    const d = await fetchPage(q, null);
     accResults = (d.results||[]).slice();
-    cursor = d.next_cursor;
+    pageToken = d.page_token || null;
     lastData = {...d, results: accResults};
     render(); renderMeta(d);
   }catch(e){ $("#meta").innerHTML=""; showError(e); }
@@ -417,15 +420,25 @@ async function search(){
 }
 
 async function loadMore(){
-  const q = $("#q").value.trim(); if(!q || cursor==null) return;
+  const q = $("#q").value.trim(); if(!q || !pageToken) return;
   const btn=$("#more"); if(btn){ btn.disabled=true; btn.innerHTML=`<span class="spin"></span> yüklənir…`; }
   try{
-    const d = await fetchPage(q, cursor);
+    const d = await fetchPage(q, pageToken);
     accResults = accResults.concat(d.results||[]);
-    cursor = d.next_cursor;
+    pageToken = d.page_token || null;
     lastData = {...d, results: accResults};
     render(); renderMeta(d);
-  }catch(e){ showError(e); const b=$("#more"); if(b){b.disabled=false;b.textContent="Daha çox yüklə ↓";} }
+  }catch(e){
+    showError(e);
+    if(e.status===422){
+      /* the token is stale (minted by a previous server run) or refused —
+         retrying the same one only 422s again, so drop it and re-render
+         without the button. A fresh search is the only way forward. */
+      pageToken = null; render();
+    } else {
+      const b=$("#more"); if(b){b.disabled=false;b.textContent="Daha çox yüklə ↓";}
+    }
+  }
   finally{ health(); }
 }
 

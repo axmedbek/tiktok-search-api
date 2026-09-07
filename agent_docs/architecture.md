@@ -6,7 +6,7 @@ TikTok mobile-search-as-a-service. The project reproduces TikTok's signed mobile
 
 ```
 client (curl / demo.html / caller)
-        │  POST /search  { query, type, limit, cursor, fan_out }
+        │  POST /search  { query, type, limit, page_token, fan_out }
         ▼
 FastAPI app (api/app.py create_app)
         │
@@ -24,24 +24,26 @@ RapidSigner (rapid_signer.py) ──HTTP──► RapidAPI signer      + capture
 TikTok search host (search19-normal-alisg.tiktokv.com)
         │  raw JSON (data[] mixed: videos + user cards + ads)
         ▼
-mapping.py flatten_video / flatten_user ──► SearchPage(records, cursor, next_cursor, has_more)
+mapping.py flatten_video / flatten_user ──► SearchPage(records, cursor, next_cursor,
+                                                        has_more, endpoints, seen)
 ```
 
 ## Component responsibilities
 
 | Module | Responsibility |
 |--------|----------------|
-| `api/app.py` | FastAPI factory. Resolves `identities_path` (env `TIKTOK_IDENTITIES_PATH` > config `identities_path:` relative-to-config > default). Wires IdentityStore into ClientPool. Endpoints: `POST /search`, `GET /health`. Maps domain errors → HTTP (SoftError/TransportError → 502, RateLimited/cap → 429, busy → 503). |
+| `api/app.py` | FastAPI factory. Resolves `identities_path` (env `TIKTOK_IDENTITIES_PATH` > config `identities_path:` relative-to-config > default). Wires IdentityStore into ClientPool. Endpoints: `POST /search`, `GET /health`. Decodes/mints `page_token` and pins the serving device. Maps domain errors → HTTP centrally: SoftError/TransportError → 502, RateLimited → 429, `PoolExhausted` by its `PoolCode` (`CAP` → 429, everything else → 503), and any token/query `ValueError` → 422. |
 | `api/schemas.py` | Pydantic request/response models (`SearchRequest`, `SearchResponse`, `HealthResponse`). |
 | `config.py` | Frozen `ClientConfig` / `PoolConfig` dataclasses. `from_mapping` (filters unknown keys), `with_overrides` (per-device merge). |
-| `pool.py` | `ClientPool` — one `DeviceSlot` per identity (or per static device / synthetic). Round-robin proxy assignment. `acquire()` skips stale/exhausted slots and hot-reloads identities. Daily per-device cap, UTC day roll. `run()` reports ok/empty back to the identity for health tracking. `run_merged()` fans out across slots and dedupes. |
+| `pool.py` | `ClientPool` — one `DeviceSlot` per identity (or per static device / synthetic). Round-robin proxy assignment. `acquire()` skips stale/exhausted slots and hot-reloads identities, or targets one slot by its stable `hmac(identity_key)` handle when a `page_token` pins it (never the positional `id{i}` label, which a file reorder would repoint at a different device). Daily per-device cap, UTC day roll. `run()` reports ok/empty back to the identity for health tracking. `run_merged()` fans out across slots and dedupes. |
 | `identity_manager.py` | `IdentityStore` — loads warm identities from JSON, hot-reloads on mtime change, tracks per-identity health (N consecutive empty → `stale`; a new cookie/token resets health). This is the auto-refresh layer that fixes the "100/100 empty" failure. |
-| `client.py` | `TikTokClient` — builds the search URL + query params, signs via RapidSigner (direct mode) or MetasecSigner (legacy), GETs the search host, retries, and detects `hit_shark` (empty result → SoftError so it never leaks as a silent 200). Paginates two endpoints (`single/` + `search/item/`) merging deduped results. |
+| `client.py` | `TikTokClient` — builds the search URL + query params, signs via RapidSigner (direct mode) or MetasecSigner (legacy), GETs the search host, retries, and detects `hit_shark` (empty result → SoftError so it never leaks as a silent 200). Paginates two endpoints (`single/` + `search/item/`) merging deduped results, seeding each endpoint's cursor + `search_id` session from an incoming `page_token`. |
 | `rapid_signer.py` | `RapidSigner` — calls the RapidAPI signer (`tiktanic` `/android/get_sign` or `working` `/sign`), returns x-argus/x-gorgon/x-ladon/x-khronos + assembled request headers. |
 | `signing.py` / `tiktok_signer/**` | Vendored pure-Python signer (v37-era). Superseded by RapidSigner for v46; kept for the legacy `config_signed.yaml` path. |
+| `paging.py` | Opaque cross-request pagination token. HMAC-authenticated (`base64url(json).base64url(tag)`) under a per-process secret, so a caller cannot forge the device pin; carries per-endpoint `(path, cursor, search_id, has_more, started)`, an `hmac`-derived device handle (never a raw `device_id`), and a bounded window of recent record-id fingerprints that seeds `seen` across requests. Every bound is checked, and the tag is verified before any base64/JSON parse. Tokens die on restart. |
 | `mapping.py` | `flatten_video` / `flatten_user` — turn raw TikTok aweme/user objects into stable, client-facing records. Skips non-video items (user cards, ads) in the mixed `data[]`. |
 | `filters.py` | `SearchKind` / `SortType` / `PublishTime` enums, `SearchFilters` (→ flat v46 query params), `SearchQuery` (validated), `SearchPage` (result). |
-| `errors.py` | Domain exceptions: `RateLimited`, `SoftError` (hit_shark / soft reject), `TransportError`, `PoolExhausted`. |
+| `errors.py` | Domain exceptions: `RateLimited`, `SoftError` (hit_shark / soft reject), `TransportError`, `PoolExhausted` — the last carrying a `PoolCode` (`CAP`/`BUSY`/`GONE`/`STALE`) so `app.py` maps status on an enum rather than a prose substring. |
 | `capture_identity_addon.py` | mitmproxy addon (runs outside the app, alongside the emulator) — harvests fresh x-tt-token + sessionid + device fingerprint from the logged-in app and atomically rewrites `identities.json`. |
 
 ## The central problem: hit_shark (risk-control)
@@ -69,8 +71,10 @@ The architecture's answer: **warm, hot-reloadable identities with health trackin
 ## Data flow invariants
 
 - `data[]` from `/aweme/v1/general/search/single/` is **mixed** — most items are videos (`type=1`, wrapped in `aweme_info`, has `aweme_id`), some are user cards / ads (no `aweme_id`). `client.py` `unwrap` and `mapping.py` skip non-video items. Never assume `data[0]` is a video.
-- Pagination: `offset` = previous cursor, echo `search_id` from `log_pb.impr_id`, `count=10` in direct mode. Stop on `has_more=false` or non-advancing cursor.
-- An empty result in direct mode is an **error condition** (`SoftError`), not a valid empty page — surfaced as HTTP 502 so callers can distinguish "genuinely no results" from "shadow-blocked".
+- Pagination is a **session**, not an offset. `offset` = TikTok's own previous `cursor` (authoritative — dedup drops items, so a page can hold 15 records while the cursor is 20), and the request must echo `search_id` from `log_pb.impr_id`. A request at `offset > 0` *without* `search_id` gets `search_nil_item: empty_session` and no records — measured identically on the local and the RapidAPI signer, so it is session state, never signing or identity. Stop on `has_more=false`, on a cursor that does not advance past the **previous** iteration's, or on `MAX_PAGES_PER_ENDPOINT`.
+- Callers resume with `page_token` (`paging.py`), never with a bare `cursor`. `next_cursor` is informational only.
+- An empty result in direct mode is an **error condition** (`SoftError`) → HTTP 502 — **but only for a sessionless first page.** A request that carried a `search_id` is a continuation, and an empty reply there is the end of the stream: it returns `200 {count: 0, has_more: false, page_token: null}` in one signed request, and does not count against identity health. Without that split, following your own `page_token` to the end of any result set retired the sole warm identity in three requests (`DEFAULT_STALE_AFTER`) and 503'd every caller.
+- The continuation tail is an **allow-list** (`empty_session`, `federation_empty`, or an empty page with no nil block at all) that **fails closed**: `hit_shark` or any nil this code does not recognise still raises `SoftError` → 502 and still reports the empty, so a session can never launder risk-control. An allow-listed tail is terminal for that endpoint regardless of the `has_more` the reply carries — trusting `has_more: true` on a reply already classified as terminal produced an unbounded chain of empty pages at one paid signature each.
 
 ## ADRs
 

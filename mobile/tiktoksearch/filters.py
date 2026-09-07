@@ -3,6 +3,8 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .paging import EndpointState, PageToken
+
 class SearchKind(str, Enum):
     KEYWORD = 'keyword'
     HASHTAG = 'hashtag'
@@ -55,6 +57,9 @@ class SearchQuery:
     limit: int = 30
     cursor: int = 0
     filters: SearchFilters = field(default_factory=SearchFilters)
+    # Opaque resume state from a previous page: TikTok's own cursor + the
+    # `search_id` session handle per endpoint. Mutually exclusive with `cursor`.
+    page_token: PageToken | None = None
 
     def __post_init__(self) -> None:
         if not self.term or not self.term.strip():
@@ -65,6 +70,8 @@ class SearchQuery:
             raise ValueError('cursor must be >= 0')
         if self.kind is SearchKind.USER and (not self.filters.is_empty()):
             raise ValueError('filters are not supported for user search')
+        if self.page_token is not None and self.cursor:
+            raise ValueError('pass either cursor or page_token, not both')
         object.__setattr__(self, 'term', self.term.strip())
 
     @property
@@ -87,3 +94,12 @@ class SearchPage:
     cursor: int
     next_cursor: int | None
     has_more: bool
+    # Per-endpoint end state (TikTok's cursor + search_id + has_more/started)
+    # the API layer mints the next page_token from. Empty for pages that cannot
+    # be resumed (e.g. a merged multi-device fan-out page).
+    endpoints: tuple[EndpointState, ...] = ()
+    # Bounded window of the record fingerprints this stream has served, carried
+    # in the next page_token so the following request can seed its dedup set.
+    # Without it, cross-request dedup rests on per-endpoint cursor monotonicity
+    # alone, which breaks the moment two endpoints drive one stream.
+    seen: tuple[bytes, ...] = ()
