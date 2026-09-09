@@ -5,7 +5,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from enum import Enum
+from typing import Callable, Generic, Optional, TypeVar
 from .client import TikTokClient
 from .config import PoolConfig
 from .errors import PoolCode, PoolExhausted, SoftError
@@ -48,6 +49,125 @@ class ServedBy:
     non-secret handle a page_token pins on."""
     label: str
     handle: str
+
+
+class HealthVerdict(Enum):
+    """What one pooled call proved about the identity that served it.
+
+    * `OK` — the identity is trusted; clears its consecutive-empty count.
+    * `EMPTY` — the reply is evidence of risk-control. It counts toward
+      DEFAULT_STALE_AFTER and eventually RETIRES the identity, so it is
+      reserved for emptiness that has no innocent explanation.
+    * `NEUTRAL` — the call proved nothing either way and is not reported at
+      all, neither ok nor empty. This is the verdict for emptiness the
+      endpoint's own domain explains: a search-session tail, or a private /
+      zero-post account whose posts list is legitimately `[]`. Charging those
+      as EMPTY would let three ordinary requests retire the only warm identity
+      and 503 every caller.
+
+    A PLAIN Enum, unlike the `(str, Enum)` shape `PoolCode` uses: that mixin
+    exists so a code can cross the HTTP boundary as a string, which a verdict
+    never does — and it would make the bare string `'ok'` hash and compare
+    equal to `OK`, quietly accepting a caller that returned a loose string
+    instead of a member.
+    """
+    OK = 'ok'
+    EMPTY = 'empty'
+    NEUTRAL = 'neutral'
+
+
+# `_report`'s `ok=` per verdict; None means "do not report at all". A table
+# rather than an if/elif chain so an unrecognised verdict raises KeyError
+# instead of falling through to a default — every default here is a bug:
+# defaulting to OK would mask a cold identity, EMPTY would retire a healthy
+# one, and NEUTRAL would silently disable identity health for that endpoint.
+_REPORT_BY_VERDICT: dict[HealthVerdict, Optional[bool]] = {
+    HealthVerdict.OK: True,
+    HealthVerdict.EMPTY: False,
+    HealthVerdict.NEUTRAL: None,
+}
+
+_CallResult = TypeVar('_CallResult')
+
+
+@dataclass(frozen=True, slots=True)
+class CallOutcome(Generic[_CallResult]):
+    """What a `run_call` callable hands back: its result AND its verdict.
+
+    Both fields are REQUIRED, deliberately. The verdict cannot be inferred
+    from the result — no records is risk-control evidence on a first search
+    page and an ordinary answer for a private account's posts — so any default
+    would be wrong for half the callers. A call that forgets it therefore gets
+    a TypeError from this constructor, at the line with the bug, rather than
+    being silently treated as ok or as empty."""
+    result: _CallResult
+    verdict: HealthVerdict
+
+
+def _search_verdict(page: SearchPage, *, continuation: bool) -> HealthVerdict:
+    """How a completed search reflects on the identity that served it.
+
+    An EMPTY PAGE is judged as identity evidence on first pages only: a
+    continuation carries a search_id, and an empty answer to one is the tail
+    of that session, not risk-control. Counting those would let three ordinary
+    "load more" tails (DEFAULT_STALE_AFTER) retire the only warm identity and
+    503 every caller.
+
+    A SoftError is reported either way — by `run_call`, which owns every
+    exception path, not here. Session-shaped emptiness never reaches this
+    point any more — `client._get_signed` returns it as data — so a SoftError
+    that still escapes on a continuation is genuine risk-control evidence (a
+    non-zero `status_code`, or a nil with has_more=true), and anti-block
+    invariant (b) needs IdentityStore to see it. It is not abusable: page
+    tokens are HMAC-bound, so a replay that trips report_empty three times
+    means the identity really is answering risk-control-shaped.
+
+    This rule is SEARCH's, which is why it lives beside `run` rather than
+    inside `run_call`: it must NOT be applied to the posts endpoint, where a
+    private or zero-post account genuinely returns nothing and three such
+    lookups would retire an identity that did nothing wrong. That endpoint's
+    rule is `posts_verdict` immediately below — the two are deliberately
+    neighbours, so a change to one is read against the other.
+    """
+    if page.records:
+        return HealthVerdict.OK
+    if continuation:
+        return HealthVerdict.NEUTRAL
+    return HealthVerdict.EMPTY
+
+
+def posts_verdict(page: SearchPage) -> HealthVerdict:
+    """How a completed `/user/posts` page reflects on the identity.
+
+    PUBLIC and living here, beside `_search_verdict`, because the two are one
+    policy in two halves: identity-health rules are what anti-block review
+    reads this module for, and a second rule hidden in the HTTP layer is a rule
+    nobody checks against its sibling. `run_call` still takes the verdict from
+    the caller's `fn` — this is the rule, not its application.
+
+    Deliberately NOT `_search_verdict`, which is search's own: that one charges
+    an empty FIRST page as EMPTY evidence, and three of those retire the only
+    warm identity and 503 every caller. On this endpoint an empty page has
+    innocent explanations that say nothing about risk-control — a session that
+    has run dry for a handle search surfaces little of, and (once the real
+    posts endpoint serves this) a private or zero-post account — so it is
+    NEUTRAL: reported neither ok nor empty. That is also why it takes no
+    `continuation` flag: first page and tail are treated alike here, so there
+    is nothing for the caller to get wrong.
+
+    Genuine risk-control still reaches identity health, which is what makes
+    NEUTRAL safe: `client._get_signed` raises SoftError for a search reply that
+    carried no payload — including every sessionless empty first page — and
+    `run_call` reports EVERY escaping SoftError as an empty whatever the
+    verdict would have said.
+
+    Judged on the UNFILTERED page: the author filter is this service's own
+    doing, and dropping every record of a page the identity really did serve
+    says nothing about the identity."""
+    if page.records:
+        return HealthVerdict.OK
+    return HealthVerdict.NEUTRAL
+
 
 def _utc_day() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -236,39 +356,60 @@ class ClientPool:
                 slot.inflight.release()
             self._cond.notify_all()
 
-    def run(self, query: SearchQuery, *, handle: Optional[str]=None) -> tuple[ServedBy, SearchPage]:
-        """Serve one search. `handle` pins the device (page_token continuation).
+    def run_call(self, fn: Callable[[TikTokClient], CallOutcome[_CallResult]],
+                 *, handle: Optional[str]=None) -> tuple[ServedBy, _CallResult]:
+        """Serve one call on one pooled device. `handle` pins the device.
 
-        An EMPTY PAGE is judged as identity evidence on first pages only: a
-        continuation carries a search_id, and an empty answer to one is the tail
-        of that session, not risk-control. Counting those would let three
-        ordinary "load more" tails (DEFAULT_STALE_AFTER) retire the only warm
-        identity and 503 every caller.
+        Everything the pool does AROUND a call lives here and nowhere else:
+        `acquire` (including the page_token device pin), the daily-cap
+        reservation it performs, the identity-health `_report` and `release`.
+        `run` is a thin wrapper over this, so a second endpoint cannot ship a
+        second, subtly different copy of that machinery.
 
-        A SoftError is reported either way. Session-shaped emptiness never
-        reaches here any more — `client._get_signed` returns it as data — so a
-        SoftError that still escapes on a continuation is genuine risk-control
-        evidence (a non-zero `status_code`, or a nil with has_more=true), and
-        anti-block invariant (b) needs IdentityStore to see it. It is not
-        abusable: page tokens are HMAC-bound, so a replay that trips
-        report_empty three times means the identity really is answering
-        risk-control-shaped."""
+        `fn` returns its result together with an explicit `HealthVerdict`,
+        because only `fn` knows what its own emptiness means — see
+        `HealthVerdict` and `_search_verdict`.
+
+        A `SoftError` is reported as empty whatever `fn` would have said, and
+        it is the ONLY exception class that reports anything. `client.py`
+        picks its exception classes knowing that, and two of those choices
+        rest on it: `TransportError` is what a well-formed-but-odd payload
+        raises precisely so a healthy identity is not charged for it, and
+        `NotFound` is deliberately outside the `SoftError` hierarchy so a
+        username the caller made up costs the identity nothing. Broadening
+        this `except` would silently undo both arguments. `ValueError` is not
+        caught either: the ValueErrors on this path are `paging.encode` /
+        `decode` failures raised in `api/app.py` after this returns, and
+        swallowing that class here would hide a real producer bug.
+        """
         slot = self.acquire(handle)
-        continuation = query.page_token is not None
         try:
-            page = slot.client.search(query)
+            outcome = fn(slot.client)
         except SoftError:
             # Every attempt came back empty/shadow-blocked → penalize the identity.
             self._report(slot, ok=False)
             raise
         else:
-            if page.records:
-                self._report(slot, ok=True)
-            elif not continuation:
-                self._report(slot, ok=False)
-            return (slot.served_by, page)
+            ok = _REPORT_BY_VERDICT[outcome.verdict]
+            if ok is not None:
+                self._report(slot, ok=ok)
+            return (slot.served_by, outcome.result)
         finally:
             self.release(slot)
+
+    def run(self, query: SearchQuery, *, handle: Optional[str]=None) -> tuple[ServedBy, SearchPage]:
+        """Serve one search. `handle` pins the device (page_token continuation).
+
+        A thin wrapper over `run_call`: the only search-specific part left is
+        `_search_verdict`, which carries the empty-page reasoning."""
+        continuation = query.page_token is not None
+
+        def call(client: TikTokClient) -> CallOutcome[SearchPage]:
+            page = client.search(query)
+            return CallOutcome(result=page,
+                               verdict=_search_verdict(page, continuation=continuation))
+
+        return self.run_call(call, handle=handle)
 
     def _report(self, slot: DeviceSlot, *, ok: bool) -> None:
         if self._identities is None or slot.identity_key is None:

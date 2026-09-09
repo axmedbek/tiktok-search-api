@@ -26,7 +26,8 @@ Single source of project-specific commands, versions, and conventions. Every age
 
 - **pytest**, tests live in `mobile/tiktoksearch/tests/`. Class-based grouping (`class TestX:`), plain `assert`, `pytest.raises` for error cases.
 - Network- and emulator-dependent code (the live client search, the RapidAPI signer, the capture addon) is NOT covered by the automated suite — it needs live identities/proxies/emulator. Test pure logic (config parsing, filters, identity health/reload, mapping, pagination dedup, token round-trips) with fakes; never hit TikTok or RapidAPI in a unit test.
-- `tests/conftest.py` installs a session-scoped `HTTPAdapter.send` tripwire that **fails the run** if any test reaches the network, so a test can never spend signer quota. The local signer's crypto runs in-process, so `signer: local` paths are testable without stubbing the signature itself.
+- `tests/conftest.py` installs a session-scoped `HTTPAdapter.send` tripwire that **fails the run** if any test reaches the network, so a test can never spend signer quota. The local signer's crypto runs in-process, so `signer: local` paths are testable without stubbing the signature itself. `conftest.py` is the ONLY stubbing mechanism — its fake roster is in `testing.md`, and adding a parallel one is a review finding.
+- **A green suite is not evidence on its own.** Nine mutations to load-bearing rules survived a fully green 497-test run in one session — including `NEUTRAL → True` (which would stop a dying identity ever being retired) and dropping `reverse=True` (which would invert every post feed). For any change to classification, ordering, or health-verdict logic: mutate the production rule, confirm the new test fails, restore, verify by checksum, and report the table. `testing.md` records the assertion shapes that look fine and prove nothing.
 
 ## Config files (three signer profiles)
 
@@ -69,5 +70,6 @@ The signer and the direct-API path are separate concerns — `_direct` is no lon
 
 ## Browser Testing
 
-- **Not applicable in the usual sense.** There is no web UI to drive with Playwright. `demo.html` is a static HTML client, not a build target.
-- "User-visible behavior" here = the **HTTP API responses** (`POST /search`, `GET /health`). Verify those with `curl` against `http://127.0.0.1:8000` (or the public tunnel URL), not a browser. See `.claude/agents/api-verifier.md`.
+- **No build target, and no browser driver that works here.** `demo.html` is a static HTML client. Headless Firefox is present but snap-confined and times out under instrumentation, so **CSS layout is not verifiable by measurement on this machine** — a visual change ships on reading plus the developer opening the page.
+- **Its JavaScript logic IS verifiable, and that is where the bugs were.** Extract the inline `<script>` and drive it in QuickJS with a small DOM shim, fed real saved API responses. That approach caught two live defects the eye missed: `esc()` throwing on a non-zero number and not escaping quotes (an attribute-context hole), and FastAPI's array-shaped 422 `detail` rendering as `[object Object]` on every tab. Always include an XSS pass — every field the page interpolates is API-derived and user-controlled.
+- "User-visible behavior" = the **HTTP API responses**: `POST /search`, `POST /profile`, `POST /user/posts`, `GET /health`. Verify with `curl` against `http://127.0.0.1:8000` (or the tunnel URL). See `.claude/agents/api-verifier.md`.

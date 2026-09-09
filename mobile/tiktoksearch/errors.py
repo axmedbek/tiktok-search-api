@@ -13,6 +13,15 @@ class SoftError(TikTokSearchError):
 class TransportError(TikTokSearchError):
     pass
 
+class NotFound(TikTokSearchError):
+    """TikTok answered that the requested user does not exist / is deleted.
+
+    Deliberately NOT a `SoftError`: re-signing cannot make a deleted user
+    exist, so this is raised on the first reply with no retries, and it must
+    never be reported as an empty against identity health — a healthy warm
+    identity is not at fault for a username the caller made up. Maps to HTTP
+    404 in `api/app.py`."""
+
 class PoolCode(str, Enum):
     """Why the pool could not serve a request.
 

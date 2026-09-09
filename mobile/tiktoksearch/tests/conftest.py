@@ -171,11 +171,37 @@ def rapid_ledger(monkeypatch: pytest.MonkeyPatch) -> list:
 
 
 # ---------------------------------------------------- canned TikTok replies
-def videos(ids, key: str = 'data') -> dict:
+# Every canned aweme carries a `create_time`, because every real one does. The
+# builders used to omit it, and that omission made a whole feature untestable:
+# `mapping._iso_utc` returned None for every fake, so every `_create_time_key`
+# was the unknown-date sentinel and `/user/posts`' newest-first sort was a
+# provable NO-OP. Three separate mutations of that sort passed 497/497 green.
+# The DEFAULT is one shared value on purpose: all-equal keys leave a stable
+# sort order-preserving, so pinning it here changed no existing expectation.
+DEFAULT_CREATE_TIME = 1_700_000_000
+
+
+def _create_time(aweme_id: str, create_times) -> dict:  # noqa: ANN001
+    """The `create_time` fragment for one canned aweme.
+
+    `create_times` maps `str(aweme_id)` -> epoch int. An id ABSENT from the
+    mapping gets `DEFAULT_CREATE_TIME`; a mapped value of None DROPS the key
+    entirely, which is the undated record `_newest_first` must sort to the
+    tail (upstream `create_time: 0` reaches `flatten_video` as the same None,
+    because `_iso_utc` treats a falsy ts as unknown)."""
+    if create_times is None or aweme_id not in create_times:
+        return {'create_time': DEFAULT_CREATE_TIME}
+    value = create_times[aweme_id]
+    return {} if value is None else {'create_time': value}
+
+
+def videos(ids, key: str = 'data', *, create_times=None) -> dict:
     """The item list of a video search reply, under `key`."""
     return {key: [{'aweme_info': {'aweme_id': str(i),
                                   'author': {'uid': '9', 'unique_id': 'u'},
-                                  'statistics': {}}} for i in ids]}
+                                  'statistics': {},
+                                  **_create_time(str(i), create_times)}}
+                  for i in ids]}
 
 
 def users(ids) -> dict:
@@ -184,17 +210,19 @@ def users(ids) -> dict:
 
 
 def reply(ids, *, cursor: int | None, has_more: bool, key: str = 'data',
-          sid: str | None = 'SID', nil: str | None = None) -> dict:
+          sid: str | None = 'SID', nil: str | None = None,
+          create_times=None) -> dict:
     """A successful TikTok search reply carrying `ids`.
 
     `cursor=None` omits the key entirely (the `_as_cursor` fallback path);
-    `nil` adds a `search_nil_info` block alongside the records."""
+    `nil` adds a `search_nil_info` block alongside the records;
+    `create_times` is `videos()`' per-id date override."""
     out: dict = {'status_code': 0, 'has_more': has_more}
     if cursor is not None:
         out['cursor'] = cursor
     if sid is not None:
         out['log_pb'] = {'impr_id': sid}
-    out.update(videos(ids, key))
+    out.update(videos(ids, key, create_times=create_times))
     if nil:
         out['search_nil_info'] = {'search_nil_item': nil}
     return out
@@ -210,6 +238,127 @@ def empty_reply(*, nil: str | None = None, has_more: bool = False,
     if nil:
         out['search_nil_info'] = {'search_nil_item': nil}
     return out
+
+
+def awemes(ids, *, create_times=None) -> list[dict]:
+    """Bare aweme dicts, unwrapped from the canned search items above.
+
+    `_paginate_posts` hands each raw `aweme_list` entry straight to
+    `flatten_video` with no `unwrap` step (a posts reply is not wrapped in
+    `aweme_info`), so the SAME canned record shape the search builders use is
+    unwrapped here rather than re-invented."""
+    return [item['aweme_info']
+            for item in videos(ids, create_times=create_times)['data']]
+
+
+def posts_reply(ids, *, max_cursor: int | None, has_more: bool,
+                omit_list: bool = False, create_times=None) -> dict:
+    """A successful posts reply carrying `ids`.
+
+    The posts endpoint's counterpart to `reply`, and it differs in the three
+    ways `_paginate_posts` cares about: the item list is a bare `aweme_list`,
+    the cursor is `max_cursor` (a millisecond epoch walking BACKWARDS), and
+    there is no search session. `max_cursor=None` omits the key entirely (the
+    `_as_cursor` fallback path); `omit_list=True` drops `aweme_list` (an ABSENT
+    payload key, which POSTS_PAYLOAD classifies as risk-control, unlike a
+    present-but-empty list). `log_pb` is present on purpose: this endpoint has
+    no search session, so its `impr_id` must never be read."""
+    out: dict = {'status_code': 0, 'has_more': has_more,
+                 'log_pb': {'impr_id': 'SID'}}
+    if max_cursor is not None:
+        out['max_cursor'] = max_cursor
+    if not omit_list:
+        out['aweme_list'] = awemes(ids, create_times=create_times)
+    return out
+
+
+def author_node(*, unique_id=None, nickname=None, uid='9',
+                sec_uid='SEC9') -> dict:
+    """An aweme `author` object carrying only the identity fields that decide
+    WHOSE video a record is. A value of None omits that key entirely.
+
+    The omission is the whole point. `mapping.flatten_video` fills the DISPLAY
+    field `author_username` from `unique_id or nickname`, while the IDENTITY
+    field `author_unique_id` reads `unique_id` alone — so an author built with
+    `nickname=` and NO `unique_id` is the impersonator shape: a nickname is
+    user-settable and not unique, so it must never let a foreign account (and
+    its `uid` / `sec_uid`) be served as the requested handle. `unique_id=''`
+    and a non-string `unique_id` are reachable too, and are dropped rather than
+    matched."""
+    node: dict = {}
+    for key, value in (('uid', uid), ('unique_id', unique_id),
+                       ('nickname', nickname), ('sec_uid', sec_uid)):
+        if value is not None:
+            node[key] = value
+    return node
+
+
+def authored_videos(items, key: str = 'data', *, create_times=None) -> dict:
+    """`videos()`, but with an explicit author per item.
+
+    `items` is an iterable of `(aweme_id, author)` pairs, so ONE page can carry
+    an impersonator alongside the genuine account — the case that separates
+    filtering on the identity field from filtering on the display field, which
+    a single-record page cannot see. `create_times` dates the items per id
+    (see `_create_time`), which is what makes `/user/posts`' newest-first
+    ordering observable: with the shared default every key ties and the sort
+    cannot be told apart from no sort at all."""
+    return {key: [{'aweme_info': {'aweme_id': str(i), 'author': a,
+                                  'statistics': {},
+                                  **_create_time(str(i), create_times)}}
+                  for i, a in items]}
+
+
+def authored_reply(items, *, cursor: int | None, has_more: bool,
+                   key: str = 'data', sid: str | None = 'SID',
+                   create_times=None) -> dict:
+    """`reply()` over `authored_videos` — a video-search reply whose items
+    carry caller-chosen authors. Same cursor/session shape as `reply`."""
+    out: dict = {'status_code': 0, 'has_more': has_more}
+    if cursor is not None:
+        out['cursor'] = cursor
+    if sid is not None:
+        out['log_pb'] = {'impr_id': sid}
+    out.update(authored_videos(items, key, create_times=create_times))
+    return out
+
+
+def profile_node(*, unique_id='bakuesaz', uid='777', sec_uid='SEC777',
+                 nickname='Baku Esaz', avatar='https://cdn.test/a.jpeg',
+                 **over) -> dict:
+    """A user-search `user_info` node, carrying what `flatten_profile` reads.
+
+    Deliberately carries NO `signature` and NO `region`: both are structurally
+    ABSENT from the real user-search node (measured null across 15 users), which
+    is why `/profile` reports them as null on this path. A node built here that
+    grew either key would make the interim-null contract untestable.
+
+    `**over` sets or overrides any other key (`secret`, `custom_verify`,
+    `total_favorited`, …); passing any key as None drops it, which is how the
+    `uid`-less node — a node that matches on handle but flattens to None — is
+    built."""
+    node: dict = {'follower_count': 1000, 'following_count': 10,
+                  'aweme_count': 50, 'total_favorited': 41_921_593,
+                  'secret': 0}
+    for key, value in (('uid', uid), ('unique_id', unique_id),
+                       ('sec_uid', sec_uid), ('nickname', nickname)):
+        node[key] = value
+    if avatar is not None:
+        node['avatar_larger'] = {'url_list': [avatar]}
+    node.update(over)
+    return {k: v for k, v in node.items() if v is not None}
+
+
+def user_search_reply(nodes, *, status_code: int = 0) -> dict:
+    """A user-search reply wrapping `nodes` as `user_list` entries.
+
+    An EMPTY `nodes` is the sessionless empty item list `SEARCH_PAYLOAD` reads
+    as risk-control (SoftError → 502, reported against identity health) — a
+    different outcome from a POPULATED list carrying no exact handle match,
+    which is the `NotFound` → 404 shape. Live TikTok answers a nonsense handle
+    with the latter, so both must be buildable here."""
+    return {'status_code': status_code,
+            'user_list': [{'user_info': node} for node in nodes]}
 
 
 class FakeResponse:

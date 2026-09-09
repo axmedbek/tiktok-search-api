@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from ..filters import PublishTime, SearchKind, SortType
 from ..paging import MAX_PAGE_TOKEN_CHARS
 
@@ -48,3 +48,110 @@ class HealthResponse(BaseModel):
     total_daily_capacity: int
     capacity_remaining_today: int
     devices: list[DeviceStatus]
+
+# --- user profile + user posts -------------------------------------------
+# Both endpoints are entered by HANDLE, and that handle reaches a SIGNED TikTok
+# URL as the search keyword — so it is bounded and charset-checked HERE, at the
+# boundary (.claude/rules/security.md), never downstream. TikTok handles are
+# letters, digits, '.' and '_', up to 24 characters; anything else is a client
+# error, not something to forward upstream and hope.
+MAX_USERNAME_CHARS = 24
+USERNAME_PATTERN = r'^[A-Za-z0-9._]+$'
+# `user_id` is a numeric string upstream and `sec_uid` a base64url-ish blob.
+# Neither is used to build a request on this interim path — they are echoed
+# into the posts response — but both are bounded anyway: an unbounded string a
+# caller can put in a response body is a channel, and the day one of them DOES
+# reach a signed URL again (see `client.profile`, the upgrade path) the bound is
+# already where it belongs.
+MAX_USER_ID_CHARS = 32
+USER_ID_PATTERN = r'^[0-9]+$'
+MAX_SEC_UID_CHARS = 200
+SEC_UID_PATTERN = r'^[A-Za-z0-9_-]+$'
+# Same ceiling as `SearchRequest.limit`: `/user/posts` is SERVED BY that search
+# path, so it cannot meaningfully ask for more than a search page may return.
+MAX_POSTS_LIMIT = 300
+# Where each payload came from, as a machine-readable field rather than a
+# footnote in a docstring. `user_search` is the user-search node the profile is
+# flattened from; `search` is the keyword-search reply the posts are filtered
+# out of. A caller that later sees `profile` / `posts` here is talking to a
+# server that reached the real upstream endpoints.
+PROFILE_SOURCE = 'user_search'
+POSTS_SOURCE = 'search'
+# `/user/posts` never returns an account's full post history on this path — see
+# `UserPostsResponse.complete`.
+POSTS_COMPLETE = False
+
+
+class _HandleRequest(BaseModel):
+    """Shared, validated `username` field.
+
+    A leading `@` is stripped (exactly one — `@@bob` is a typo, not a handle,
+    and is rejected rather than guessed at) and surrounding whitespace is
+    removed BEFORE the length and charset checks, so `"@bakuesaz"`,
+    `" bakuesaz "` and `"bakuesaz"` are one request. An empty or
+    whitespace-only value fails `min_length` and is a 422: it must never reach
+    `client._match_user_node`, where an empty handle is a handle no node can
+    match rather than an error."""
+    username: str = Field(min_length=1, max_length=MAX_USERNAME_CHARS, pattern=USERNAME_PATTERN, description="TikTok handle, with or without a leading `@` (e.g. `@bakuesaz`). Letters, digits, `.` and `_`, up to 24 characters. This is the ONLY way to enter either endpoint on the current path: both are served from a search reply keyed on the handle, so there is no id-only entry point — a request carrying just `user_id`/`sec_uid` is rejected with 422.")
+
+    @field_validator('username', mode='before')
+    @classmethod
+    def _normalise_username(cls, value: Any) -> Any:
+        # `mode='before'` so the normalisation happens FIRST and the declared
+        # length/charset bounds then judge the value that will actually be
+        # used. A non-string is handed back untouched for pydantic to report
+        # as the type error it is.
+        if not isinstance(value, str):
+            return value
+        return value.strip().removeprefix('@')
+
+
+class ProfileRequest(_HandleRequest):
+    model_config = {'json_schema_extra': {'examples': [{'username': '@bakuesaz'}]}}
+
+
+class ProfileResponse(BaseModel):
+    username: Optional[str] = Field(description='The handle as TikTok spells it.')
+    user_id: str = Field(description="TikTok's numeric user id. Pass it (with `sec_uid`) to `/user/posts` to keep the ids alongside a filtered page.")
+    sec_uid: Optional[str] = Field(default=None, description="TikTok's `sec_uid` for this account. Returned on purpose: the real posts endpoint keys on it, so a caller that stores it now needs no second lookup later.")
+    display_name: Optional[str] = None
+    signature: Optional[str] = Field(default=None, description='Profile bio. **Always null on this path**: the profile is flattened from the user-search node, and that node carries no `signature` at all (measured null across 15 users from two independent searches). It is not "this account has no bio".')
+    follower_count: Optional[int] = None
+    following_count: Optional[int] = None
+    aweme_count: Optional[int] = Field(default=None, description='Number of posts TikTok reports for the account. Not the number `/user/posts` can return — see `UserPostsResponse.complete`.')
+    heart_count: Optional[int] = Field(default=None, description='Total likes RECEIVED across the account (TikTok `total_favorited`), not likes it gave.')
+    region_code: Optional[str] = Field(default=None, description='Two-letter region. **Always null on this path**, for the same structural reason as `signature` — the user-search node does not carry it.')
+    verified: bool = False
+    private: bool = False
+    avatar_url: Optional[str] = Field(default=None, description="Avatar image URL on TikTok's own CDN, passed through unproxied.")
+    # No default, so it lands in the generated schema's `required` list — see
+    # `UserPostsResponse.source`. The handler passes PROFILE_SOURCE.
+    source: str = Field(description='Which upstream reply this profile was read from. `user_search` means the user-search node, the only source that serves it today.')
+    device: str = Field(description='Label of the device that served the request.')
+    elapsed_s: float
+
+
+class UserPostsRequest(_HandleRequest):
+    user_id: Optional[str] = Field(default=None, min_length=1, max_length=MAX_USER_ID_CHARS, pattern=USER_ID_PATTERN, description='Optional. The `user_id` a prior `/profile` call returned. It is not needed to fetch anything — this path searches on the handle — but supplying it pins the ids in the response even on a page whose records were all filtered out.')
+    sec_uid: Optional[str] = Field(default=None, min_length=1, max_length=MAX_SEC_UID_CHARS, pattern=SEC_UID_PATTERN, description='Optional, and exactly like `user_id`: echoed back, never used to fetch.')
+    limit: int = Field(default=30, ge=1, le=MAX_POSTS_LIMIT, description='Max results to ASK SEARCH for (server-capped by `max_results_per_search`). Records by other authors are then dropped, so `count` is normally well below this — see `count`.')
+    page_token: Optional[str] = Field(default=None, max_length=MAX_PAGE_TOKEN_CHARS, description="Opaque continuation token from a prior response's `page_token`. Bound to this endpoint and this handle: a `/search` token is rejected here with 422, and so is this one at `/search`. It pins the device that served the previous page, and like every page_token it does not survive a server restart.")
+    model_config = {'json_schema_extra': {'examples': [{'username': '@bakuesaz', 'limit': 60}]}}
+
+
+class UserPostsResponse(BaseModel):
+    username: str = Field(description='The handle that was asked for, normalised (no leading `@`).')
+    user_id: Optional[str] = Field(default=None, description='Echoed from the request when it supplied one, else read off the first kept record. Null when the request supplied none and this page kept nothing.')
+    sec_uid: Optional[str] = Field(default=None, description='Same provenance as `user_id`.')
+    # Neither carries a Pydantic default, deliberately: a defaulted field is
+    # omitted from OpenAPI's `required` list, and a generated client would then
+    # type it optional-and-possibly-missing — exactly the doc-footnote status
+    # these two fields exist to avoid. The handler passes both explicitly.
+    source: str = Field(description="Where these posts came from, machine-readably. `search` means they are the videos KEYWORD SEARCH surfaces for this handle, filtered down to the ones this account authored — not a read of the account's post feed. Treat any other value as a different (better) source.")
+    complete: bool = Field(description="Whether this is the account's full post history. **Always false on the `search` source:** the set is whatever keyword search surfaces for the handle, so posts the account really has may never appear — in practice a small fraction of a large account's catalogue. Yield tracks how visible the account is in search, and a low-visibility account can legitimately return few results or none. This is about COMPLETENESS only: `results` is ordered newest-first within each page (see `results`), so a short page is still a correctly ordered page.")
+    device: str = Field(description='Label of the device that served the request.')
+    count: int = Field(description='How many records `results` carries — i.e. AFTER dropping the search hits by other authors. It is normally well below `limit`, and can be 0 while `has_more` is true: the filter runs after the page is fetched, so an unlucky page can be entirely other people. Keep paging. **This endpoint does not verify that the handle exists**, so a nonexistent handle also answers `200` with `count: 0` here while `/profile` answers `404` — the two are indistinguishable on this path, since a real but low-visibility account search simply may not surface; a caller that needs an existence answer asks `/profile`.')
+    has_more: bool = Field(description='Whether the underlying search has more pages. Judged on the unfiltered page, so it stays true even when `count` is 0.')
+    page_token: Optional[str] = Field(default=None, description='Pass this back as `page_token` for the next page. Null when there is nothing more to fetch.')
+    elapsed_s: float
+    results: list[dict[str, Any]] = Field(description="Video records in the IDENTICAL shape `/search` returns (`flatten_video`), so a client renders them with the same code. **Ordered newest first by `create_time`** — records whose `create_time` is null (unknown upstream) come LAST, since an undated post cannot be truthfully placed among dated ones. The order is stable, so identical requests return identical orderings. **This orders the PAGE, not the paginated STREAM:** pages still arrive in search-relevance order, so page 2 can contain videos both older AND newer than page 1. Read one page and you get a correctly ordered page; paginate and you must ACCUMULATE and RE-SORT across pages yourself.")

@@ -129,6 +129,31 @@
   .id{position:absolute;top:11px;right:13px;font:10px ui-monospace,Menlo,monospace;
     color:var(--faint);opacity:.7;}
 
+  /* profile header card (Profil tab) — spans the whole grid row */
+  .phead{grid-column:1/-1;display:flex;gap:16px;align-items:flex-start;}
+  /* The real avatar sits ON TOP of the existing .av initial block, so a CDN
+     image that fails to load just removes itself and the initial shows. */
+  .pavwrap{position:relative;width:74px;height:74px;flex:none;}
+  .pavwrap .av{width:74px;height:74px;font-size:28px;}
+  .pav{position:absolute;inset:0;width:74px;height:74px;border-radius:50%;
+    object-fit:cover;background:var(--card2);}
+  .pinfo{flex:1;min-width:0;}
+  .pname{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    font-size:18px;font-weight:800;letter-spacing:-.2px;}
+  .phandle{color:var(--muted);font-size:13px;margin:1px 0 9px;}
+  .pbio{color:var(--txt);font-size:13.5px;margin:0 0 10px;white-space:pre-wrap;
+    overflow-wrap:anywhere;}
+  .pbadge{font-size:11px;font-weight:700;color:var(--warn);
+    background:color-mix(in srgb,var(--warn) 14%,transparent);
+    border:1px solid color-mix(in srgb,var(--warn) 34%,transparent);
+    padding:2px 8px;border-radius:20px;letter-spacing:.2px;}
+  .pstats{display:flex;flex-wrap:wrap;gap:15px;color:var(--muted);font-size:13px;}
+  .pstats b{color:var(--txt);font-weight:700;}
+  /* the interim-source note: a warn banner living inside the results grid */
+  .banner.span{grid-column:1/-1;margin:0;}
+  /* the Profil tab keeps Limit but has no sort/time filters upstream */
+  .filters label.hidden{display:none;}
+
   .empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:44px 20px;
     background:var(--card);border:1px dashed var(--line);border-radius:15px;}
   .empty .big{font-size:30px;margin-bottom:8px;}
@@ -173,6 +198,7 @@
       <div class="tab active" data-t="keyword">🎬 Keyword</div>
       <div class="tab" data-t="hashtag"># Hashtag</div>
       <div class="tab" data-t="user">👤 User</div>
+      <div class="tab" data-t="profile">👤 Profil</div>
       <div class="viewtoggle" id="viewtoggle">
         <div class="vt active" data-v="cards">Kartlar</div>
         <div class="vt" data-v="json">JSON</div>
@@ -183,13 +209,13 @@
       <button class="go" id="go">Axtar</button>
     </div>
     <div class="filters" id="filters">
-      <label>Sıralama
+      <label class="videoonly">Sıralama
         <select id="sort_type">
           <option value="">Uyğunluq (default)</option>
           <option value="1">Ən çox bəyənilən</option>
         </select>
       </label>
-      <label>Vaxt
+      <label class="videoonly">Vaxt
         <select id="publish_time">
           <option value="">İstənilən vaxt</option>
           <option value="1">Son 24 saat</option>
@@ -232,6 +258,9 @@
 <script>
 // API base: override via ?api=... ; default localhost:8000
 const API = new URLSearchParams(location.search).get("api") || "http://localhost:8000";
+/* The Profil tab is not a SearchKind — it drives POST /profile + POST /user/posts
+   instead of POST /search, so it is compared by name in a few places. */
+const PROFILE = "profile";
 let kind = "keyword";
 const $ = s => document.querySelector(s);
 $("#apiUrl").textContent = API;
@@ -239,11 +268,23 @@ $("#apiUrl").textContent = API;
 /* ---- tabs ---- */
 document.querySelectorAll(".tab").forEach(t=>{
   t.onclick = ()=>{
+    const prev = kind;
     document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
     t.classList.add("active"); kind = t.dataset.t;
-    $("#q").placeholder = kind==="user" ? "İstifadəçi adı… (məs: nasa)"
+    $("#q").placeholder = kind===PROFILE ? "İstifadəçi adı… (məs: @bakuesaz)"
+      : kind==="user" ? "İstifadəçi adı… (məs: nasa)"
       : kind==="hashtag" ? "Hashtag… (məs: bitcoin)" : "Axtarış sözü… (məs: ocean)";
+    /* /user/posts takes no sort/publish filters, but Limit still drives how
+       deep its underlying search goes — so hide the two video-only selects
+       rather than the whole block. */
     $("#filters").classList.toggle("hidden", kind==="user");
+    document.querySelectorAll(".filters label.videoonly")
+      .forEach(l=>l.classList.toggle("hidden", kind===PROFILE));
+    /* Only a switch involving Profil clears the view: a profile header (or a
+       posts page_token bound to a handle) must never carry over into a
+       /search tab, or vice versa. Switching between the three search tabs
+       keeps its pre-existing behaviour. */
+    if(prev!==kind && (prev===PROFILE || kind===PROFILE)) resetResults();
   };
 });
 
@@ -265,7 +306,13 @@ async function health(){
 /* ---- helpers ---- */
 function fmt(n){ if(n==null) return "—";
   if(n>=1e6) return (n/1e6).toFixed(1)+"M"; if(n>=1e3) return (n/1e3).toFixed(1)+"K"; return n; }
-function esc(s){ return (s||"").replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+/* Quotes are escaped too, because interpolated values also land inside
+   attributes (the avatar `src`), and String() so a numeric field cannot throw
+   on .replace. In text position an entity renders as the character itself. */
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+/* Only http(s) URLs are echoed into an attribute; anything else is dropped. */
+function safeUrl(u){ return /^https?:\/\//i.test(String(u||"")) ? esc(u) : ""; }
 function dur(s){ if(s==null) return null; const m=Math.floor(s/60), r=s%60; return m?`${m}:${String(r).padStart(2,"0")}`:`${r}s`; }
 function ago(iso){ if(!iso) return null; const d=new Date(iso); if(isNaN(d)) return null;
   const days=Math.floor((Date.now()-d)/864e5);
@@ -326,6 +373,85 @@ function card(it){
   </div>`;
 }
 
+/* ---- profile header (ProfileResponse) ---- */
+function profileCard(p){
+  const initial = esc((p.display_name || p.username || "?")[0] || "?").toUpperCase();
+  const avatar = safeUrl(p.avatar_url);
+  return `<div class="item phead">
+    <div class="pavwrap">
+      <div class="av">${initial}</div>
+      ${avatar?`<img class="pav" src="${avatar}" alt="" referrerpolicy="no-referrer" onerror="this.remove()"/>`:''}
+    </div>
+    <div class="pinfo">
+      <div class="pname">
+        <span>${esc(p.display_name)||"—"}</span>
+        ${p.verified?'<span class="verified" title="Təsdiqlənmiş">✔</span>':''}
+        ${p.private?'<span class="pbadge">Qapalı hesab</span>':''}
+      </div>
+      <div class="phandle">@${esc(p.username)}</div>
+      ${/* signature and region_code are ALWAYS null on this path (see
+           ProfileResponse) — an empty bio / empty region chip would read as a
+           broken UI, so both elements are omitted rather than emptied. */''}
+      ${p.signature?`<div class="pbio">${esc(p.signature)}</div>`:''}
+      <div class="pstats">
+        <span>👥 <b>${fmt(p.follower_count)}</b> follower</span>
+        <span>➡ <b>${fmt(p.following_count)}</b> izlədiyi</span>
+        <span>🎬 <b>${fmt(p.aweme_count)}</b> video</span>
+        <span>♥ <b>${fmt(p.heart_count)}</b> bəyəni</span>
+      </div>
+      <div class="subline">
+        <span>id: ${esc(p.user_id)||"—"}</span>
+        ${p.region_code?`<span>bölgə: ${esc(p.region_code)}</span>`:''}
+        ${p.source?`<span>mənbə: ${esc(p.source)}</span>`:''}
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---- newest-first ordering for the Profil tab ---- */
+/* The same rule as the server's `_newest_first` (api/app.py): descending by
+   `create_time`, with an UNKNOWN date last — an undated post cannot be
+   truthfully placed among dated ones, so it goes to the end rather than
+   claiming to be the newest.
+
+   Needed on the client as well as the server because the server sorts one
+   PAGE: "Daha çox yüklə" appends pages that still arrive in search-relevance
+   order, so page 2 can hold videos both older and newer than page 1. Without
+   re-sorting the accumulation, loading more visibly breaks the order.
+
+   String comparison, not `new Date(...)`: `create_time` is the fixed-width
+   `YYYY-MM-DDTHH:MM:SS+00:00` form, so lexicographic order IS chronological
+   order — and it cannot produce an `Invalid Date`. */
+const CREATE_TIME_UNKNOWN = "";
+function createTimeKey(r){
+  const v = r ? r.create_time : null;
+  return (typeof v === "string" && v) ? v : CREATE_TIME_UNKNOWN;
+}
+/* A COPY, sorted. `Array.prototype.sort` is stable (ES2019+), so records
+   sharing a timestamp — and the whole undated tail — keep the order the
+   server sent, which is what makes a re-render deterministic. */
+function newestFirst(list){
+  return (list||[]).slice().sort((a,b)=>{
+    const x = createTimeKey(a), y = createTimeKey(b);
+    return x < y ? 1 : (x > y ? -1 : 0);
+  });
+}
+
+/* The interim nature of /user/posts, stated where the posts are — and read off
+   the response, so it disappears by itself the day `complete` comes back true.
+   It no longer claims the order is wrong: the server sorts each page
+   newest-first and `newestFirst` re-sorts the accumulation, so the only
+   limitation left is COMPLETENESS — which is the big one. */
+function postsNote(d){
+  if(!d || d.complete!==false) return "";
+  return `<div class="banner warn show span"><span class="bi">⚠️</span><span>
+    <b>Postlar axtarışdan gəlir — tam siyahı deyil.</b>
+    Bunlar hesabın bütün postları deyil, axtarışın bu handle üçün tapdığı
+    videolardır — böyük hesabda postların yalnız ~1%-i ola bilər. Hesab
+    axtarışda az görünürsə, nəticə də az olur. Sıralama ən yenidən köhnəyə
+    doğrudur.</span></div>`;
+}
+
 /* ---- JSON view ---- */
 function hljson(obj){
   let j = JSON.stringify(obj, null, 2);
@@ -337,14 +463,34 @@ function hljson(obj){
   return j;
 }
 
-let view = "cards", lastData = null;
+let view = "cards", lastData = null, profileData = null;
 
 function render(){
   const box = $("#results");
   box.classList.toggle("json-mode", view==="json");
-  if(!lastData){ box.innerHTML=""; return; }
+  if(!lastData && !profileData){ box.innerHTML=""; return; }
   if(view==="json"){
-    box.innerHTML = `<pre class="json">${hljson(lastData)}</pre>`;
+    /* the Profil tab is two calls, so its JSON view shows both replies */
+    box.innerHTML = `<pre class="json">${hljson(profileData?{profile:profileData,posts:lastData}:lastData)}</pre>`;
+    return;
+  }
+  if(profileData){
+    /* The header and the interim note render even on a page that kept nothing:
+       /user/posts filters by author AFTER fetching the search page, so `count`
+       can be 0 while `has_more` is true. A non-null page_token therefore still
+       gets the "Daha çox yüklə" button — an empty page here means keep paging,
+       not "no more results". */
+    let html = profileCard(profileData) + postsNote(lastData);
+    if(lastData && lastData.results.length){
+      html += lastData.results.map(card).join("");
+    }else if(lastData){
+      html += `<div class="empty"><div class="big">🎬</div>Bu səhifədə bu istifadəçinin postu tapılmadı${pageToken?" — davam edin ↓":"."}</div>`;
+    }
+    if(pageToken){
+      html += `<div class="morebar"><button class="more" id="more">Daha çox yüklə ↓</button></div>`;
+    }
+    box.innerHTML = html;
+    const pm=$("#more"); if(pm) pm.onclick=loadMore;
     return;
   }
   if(!lastData.results.length){
@@ -371,6 +517,12 @@ document.querySelectorAll(".vt").forEach(v=>{
    back empty (empty_session), so "daha çox" always sends the token. */
 let pageToken = null, accResults = [], startedAt = 0;
 
+/* Everything the results area shows, back to nothing. */
+function resetResults(){
+  lastData = null; profileData = null; accResults = []; pageToken = null;
+  banner(null); $("#results").innerHTML = ""; $("#meta").innerHTML = "";
+}
+
 function buildBody(q, token){
   const body = {type:kind, query:q, limit:parseInt($("#limit").value,10)||120};
   if(token) body.page_token = token;
@@ -382,40 +534,123 @@ function buildBody(q, token){
   return body;
 }
 
+/* POST /user/posts. `username` is required even when the ids are known (the
+   interim path searches on the handle); user_id/sec_uid are echoed back, so
+   passing the resolved ones keeps them pinned on a page that kept nothing. */
+function postsBody(q, token){
+  const body = {username:q, limit:parseInt($("#limit").value,10)||120};
+  if(profileData && profileData.username) body.username = profileData.username;
+  if(profileData && profileData.user_id) body.user_id = profileData.user_id;
+  if(profileData && profileData.sec_uid) body.sec_uid = profileData.sec_uid;
+  if(token) body.page_token = token;
+  return body;
+}
+
 function renderMeta(d){
   const parts = [
     `<span class="chip">📦 <b>${accResults.length}</b> nəticə</span>`,
     `<span class="chip">⚡ ${d.elapsed_s}s</span>`,
     `<span class="chip">📱 device <b>${esc(String(d.device))}</b></span>`,
-    `<span class="chip">↔ cursor <span class="mono">${d.cursor}→${d.next_cursor==null?"son":d.next_cursor}</span></span>`,
-    `<span class="chip">${d.has_more?"🔁 daha var":"✅ tamam"}</span>`,
   ];
+  if(kind===PROFILE){
+    /* UserPostsResponse carries no cursor pair; `count` is post-author-filter
+       while `has_more` is pre-filter, so both are worth showing side by side. */
+    parts.push(`<span class="chip">🎬 bu səhifə <b>${d.count}</b></span>`);
+    if(d.source) parts.push(`<span class="chip">🔍 mənbə <span class="mono">${esc(d.source)}</span></span>`);
+    if(d.complete===false) parts.push(`<span class="chip">⚠️ tam deyil</span>`);
+  }else{
+    parts.push(`<span class="chip">↔ cursor <span class="mono">${d.cursor}→${d.next_cursor==null?"son":d.next_cursor}</span></span>`);
+  }
+  parts.push(`<span class="chip">${d.has_more?"🔁 daha var":"✅ tamam"}</span>`);
   $("#meta").innerHTML = parts.join("");
 }
 
-async function fetchPage(q, token){
-  const r = await fetch(API+"/search",{method:"POST",headers:{"content-type":"application/json"},
-    body:JSON.stringify(buildBody(q, token))});
+/* FastAPI's own 422 puts a LIST of {loc,msg} in `detail`; the domain errors put
+   a plain string there. Both must end up as readable text. */
+function detailText(d, r){
+  const dt = d && d.detail;
+  if(typeof dt === "string" && dt) return dt;
+  if(Array.isArray(dt) && dt.length){
+    return dt.map(x=>[(x.loc||[]).slice(1).join("."), x.msg].filter(Boolean).join(": "))
+             .filter(Boolean).join("; ");
+  }
+  return r.status+" "+r.statusText;
+}
+
+async function postJSON(path, body){
+  const r = await fetch(API+path,{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify(body)});
   let d; try{ d = await r.json(); }catch{ d = {}; }
-  if(!r.ok){ const err = new Error(d.detail || (r.status+" "+r.statusText)); err.status=r.status; throw err; }
+  if(!r.ok){ const err = new Error(detailText(d, r)); err.status=r.status; throw err; }
   return d;
+}
+
+/* One page of results for the active tab — /search, or /user/posts on Profil.
+   Both reply with `results[]` + `page_token`, so the pagination loop is shared. */
+function fetchPage(q, token){
+  return kind===PROFILE ? postJSON("/user/posts", postsBody(q, token))
+                        : postJSON("/search", buildBody(q, token));
 }
 
 function showError(e){
   const msg = String(e.message||e);
-  if(e.status===429 || /quota|rate-limit/i.test(msg)){
+  if(e.status===404 && kind===PROFILE){
+    /* TikTok answered and the identity is fine — the handle simply is not
+       there. A calm notice, not an error.
+       Profil only: only /profile + /user/posts map NotFound to 404. On a
+       /search tab a 404 is FastAPI's own "Not Found", i.e. a wrong ?api= base
+       — wiring, not identity — so it falls through to the generic banner. */
+    banner("warn", `<b>Bu istifadəçi tapılmadı.</b> Handle-ı yoxlayın (məs: <code>@bakuesaz</code>).<br><span style="color:var(--muted)">${esc(msg)}</span>`);
+  } else if(e.status===422){
+    /* Two client-side causes with different reach. The stale page_token half is
+       true on EVERY tab — tokens die on restart and loadMore() hits it
+       routinely — so it is always shown. The handle-charset half can only ever
+       be the cause on Profil, so it is added there alone. */
+    const handleHint = kind===PROFILE
+      ? `İstifadəçi adı yalnız hərf, rəqəm, <code>.</code> və <code>_</code> ola bilər (maks 24). `
+      : "";
+    banner("warn", `<b>Sorğu qəbul olunmadı.</b> ${handleHint}Səhifə token-i köhnəlmişsə (server yenidən başlayıb), yenidən axtarın.<br><span style="color:var(--muted)">${esc(msg)}</span>`);
+  } else if(e.status===429 || /quota|rate-limit/i.test(msg)){
     banner("warn", `<b>Limit / kvota.</b> RapidAPI imza kvotası bitib və ya TikTok rate-limit etdi. Planı yüksəldin, təzə açar verin, ya da bir az gözləyin.<br><span style="color:var(--muted)">${esc(msg)}</span>`);
-  } else if(/hit_shark|empty search|nil/i.test(msg)){
-    banner("warn", `<b>Boş nəticə (risk-control).</b> Warm cookie/x-tt-token köhnəlmiş ola bilər — real app-dan təzə kimlik tutun.<br><span style="color:var(--muted)">${esc(msg)}</span>`);
+  } else if(e.status===502 || /hit_shark|empty search|nil/i.test(msg)){
+    /* Risk-control is the common cause and stays first, but a 502 is also what
+       an unmintable continuation token returns (`_mint_token`, shared by
+       /search and /user/posts). Name both briefly instead of asserting one. */
+    banner("warn", `<b>Boş nəticə — ehtimal ki risk-control.</b> Warm cookie/x-tt-token köhnəlmiş ola bilər — real app-dan təzə kimlik tutun. Daha nadir haldır, amma növbəti səhifə token-i hazırlana bilməyəndə də bu cavab gəlir.<br><span style="color:var(--muted)">${esc(msg)}</span>`);
   } else {
     banner("err", `<b>Xəta.</b> ${esc(msg)}`);
   }
 }
 
+/* ---- Profil tab: /profile, then /user/posts for the same handle ---- */
+/* Two calls, two daily-cap units. The ids from /profile are handed to
+   /user/posts so the response pins them even on a page that keeps nothing. */
+async function searchProfile(){
+  const q = $("#q").value.trim(); if(!q) return;
+  $("#go").disabled=true; resetResults();
+  $("#meta").innerHTML = `<span class="chip"><span class="spin"></span> profil yüklənir…</span>`;
+  try{
+    profileData = await postJSON("/profile", {username:q});
+    render();
+    $("#meta").innerHTML = `<span class="chip"><span class="spin"></span> postlar yüklənir…</span>`;
+    const d = await fetchPage(q, null);
+    accResults = newestFirst(d.results);
+    pageToken = d.page_token || null;
+    lastData = {...d, results: accResults};
+    render(); renderMeta(d);
+  }catch(e){
+    /* If the profile loaded and only the posts call failed, keep the header
+       on screen — the error is about the posts, not the account. */
+    $("#meta").innerHTML=""; showError(e); render();
+  }
+  finally{ $("#go").disabled=false; health(); }
+}
+
 async function search(){
+  if(kind===PROFILE) return searchProfile();
   const q = $("#q").value.trim(); if(!q) return;
   banner(null);
-  $("#go").disabled=true; lastData=null; accResults=[]; pageToken=null;
+  $("#go").disabled=true; lastData=null; profileData=null; accResults=[]; pageToken=null;
   $("#results").innerHTML=""; $("#meta").innerHTML = `<span class="chip"><span class="spin"></span> axtarılır…</span>`;
   try{
     const d = await fetchPage(q, null);
@@ -433,6 +668,9 @@ async function loadMore(){
   try{
     const d = await fetchPage(q, pageToken);
     accResults = accResults.concat(d.results||[]);
+    /* Profil only. /search's ordering is search relevance and is the contract
+       there — re-sorting it would change an endpoint this tab does not own. */
+    if(kind===PROFILE) accResults = newestFirst(accResults);
     pageToken = d.page_token || null;
     lastData = {...d, results: accResults};
     render(); renderMeta(d);

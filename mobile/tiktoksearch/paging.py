@@ -26,9 +26,32 @@ Three properties matter and are enforced here:
   label, which can silently repoint at a different device) and — being keyed —
   is not a brute-forceable commitment to a 19-digit `device_id` the way a bare
   `sha256` would be.
-* **Self-bounded.** `MAX_PAGE_TOKEN_CHARS` is DERIVED from the worst-case
-  token this module can build, and `encode` checks the wire length against it,
-  so the server can never mint a token that `decode` would then refuse.
+* **Self-bounded on the two bounds a mint can reach.** The cursor bound and
+  the size cap are enforced on BOTH sides, so the server cannot hand out a
+  continuation it would then 422: the cursor is checked against its own path's
+  bound in `encode` as well as `decode`, and `MAX_PAGE_TOKEN_CHARS` is DERIVED
+  from the largest token `encode` can mint. The remaining `decode` bounds —
+  `MAX_ENDPOINTS`, `MAX_ENDPOINT_PATH_CHARS`, the path allow-list,
+  `MAX_SEARCH_ID_CHARS` and its charset, `TOKEN_VERSION` and the
+  device-handle length — are NOT re-checked by `encode`; they are enforced at
+  INGEST by their producers instead (`sanitize_search_id` for `sid`, the path
+  constants in `client.py` for `p`, `device_handle` for `dev`). Two of those
+  asymmetries would bite the same way the cursor one did, but NOT by raising.
+  MEASURED, not assumed: an over-long path, or a fifth endpoint, handed to
+  `encode` MINTS SUCCESSFULLY. It quietly sheds dedup fingerprints to fit and
+  returns a token whose very next request is 422'd (`_MALFORMED`) by
+  `MAX_ENDPOINT_PATH_CHARS` / the path allow-list, or by `MAX_ENDPOINTS` — so
+  the caller loses the continuation anyway AND the dedup window was silently
+  shrunk on the way out. `_TOO_LONG` sits far past that boundary: with
+  maximum-length search_ids, four endpoints mint at every path length from 65
+  to 384 characters (wire 3129-3134, window shed from 239 fingerprints down to
+  ZERO — at 383 and 384 the token still mints with an entirely EMPTY window,
+  i.e. cross-page dedup completely disabled) and first raise at 385, while a
+  realistic 32-character path mints at 5 through 10 endpoints (wire 3129-3134,
+  window 224 down to 28) and first raises at 11. Neither is reachable today,
+  because every path is an allow-listed module constant of at most 32
+  characters and every producer respects `MAX_ENDPOINTS`; they are held closed
+  by the producers' discipline, not by a check in `encode`.
 
 `q` binds the token to its originating query so it cannot be replayed against a
 different search. Every validation failure is a `ValueError` — a client error
@@ -72,7 +95,33 @@ _TOKEN_SECRET = secrets.token_bytes(_SECRET_BYTES)
 # Hard bounds. A token is caller-supplied input on the path to a SIGNED TikTok
 # URL served by a live warm identity, so every field is bounded before it can
 # reach `client.py`.
+#
+# The cursor bound is PER-PATH, because the two endpoint families do not count
+# in the same unit and no single bound is right for both:
+#
+# * the search paths page on a forward OFFSET into a result set, where 100_000
+#   is already far deeper than TikTok will serve;
+# * the posts path pages on `max_cursor`, a MILLISECOND EPOCH walking backwards
+#   through the user's timeline (~1.79e12 today), so the offset bound is
+#   exceeded on the very first page and every posts continuation would 422.
+#
+# Both stay HARD bounds — a search cursor above MAX_ENDPOINT_CURSOR is still
+# rejected — and the selection fails closed: see `cursor_bound`.
 MAX_ENDPOINT_CURSOR = 100_000
+# 2100-01-01T00:00:00Z in milliseconds. A CALENDAR ceiling, not a machine one:
+# `max_cursor` is a post's creation time, so a value beyond this is not a
+# timestamp at all and has no business in a signed URL. It is ~2.3x today's
+# value, so neither clock skew nor a re-based TikTok epoch can reach it within
+# this service's lifetime, and it costs 7 digits per endpoint in the derived
+# MAX_PAGE_TOKEN_CHARS below. (`2**63` would admit any integer whatsoever,
+# which is not a bound.)
+MAX_MS_EPOCH_CURSOR = 4_102_444_800_000
+# The paths whose cursor is a millisecond epoch. Spelled out here rather than
+# imported from `client.py`, which imports THIS module — the import would be a
+# cycle. A divergence between the two spellings fails CLOSED: the posts path
+# would fall back to the offset bound and refuse to mint its own tokens, which
+# is loud, rather than widening a bound, which would be silent.
+_MS_EPOCH_CURSOR_PATHS = frozenset(('/aweme/v1/aweme/post/',))
 MAX_ENDPOINTS = 4
 MAX_SEARCH_ID_CHARS = 128
 MAX_ENDPOINT_PATH_CHARS = 64
@@ -129,6 +178,10 @@ _QUERY_MISMATCH = 'page_token does not belong to this query'
 # `encode` sheds dedup fingerprints before it could ever get here. Kept as a
 # hard stop so a future field cannot quietly mint a token decode would refuse.
 _TOO_LONG = 'page_token could not be minted within its size bound'
+# Same posture as _TOO_LONG — refuse to mint rather than hand out a token the
+# next request rejects — but never trimmable: the cursor IS the resumable
+# state, so there is nothing to shed and `encode` raises.
+_UNMINTABLE_CURSOR = 'page_token could not be minted within its cursor bound'
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,12 +312,36 @@ def sanitize_search_id(value: object) -> str:
     return value
 
 
+def cursor_bound(path: str) -> int:
+    """The hard cursor bound for `path`, in `path`'s own pagination unit.
+
+    Fail-closed by construction: only a path explicitly known to page on a
+    millisecond epoch gets that laxer bound, and everything else — including a
+    path this module has never heard of — gets the strict offset bound, so no
+    path can select a bound looser than its own family's.
+
+    This answers 'how large may this cursor be', never 'is this path allowed'.
+    `decode` must have already accepted `path` against the caller's allow-list
+    before asking."""
+    if path in _MS_EPOCH_CURSOR_PATHS:
+        return MAX_MS_EPOCH_CURSOR
+    return MAX_ENDPOINT_CURSOR
+
+
 def encode(token: PageToken) -> str:
     """Serialise and sign `token`.
 
     Guaranteed never to exceed MAX_PAGE_TOKEN_CHARS: that bound is derived from
     the worst case this function can produce, and the dedup window — the only
     droppable state — is shed oldest-first if anything ever pushed past it."""
+    for endpoint in token.endpoints:
+        # decode() refuses a cursor outside its path's bound, so minting one
+        # would hand the caller a continuation whose very next request is
+        # 422'd — a server that mints tokens it rejects is worse than one that
+        # refuses to mint. Unlike the dedup window there is nothing droppable
+        # here, so this raises (see _UNMINTABLE_CURSOR) instead of trimming.
+        if endpoint.cursor < 0 or endpoint.cursor > cursor_bound(endpoint.path):
+            raise ValueError(_UNMINTABLE_CURSOR)
     trimmed = token
     if len(trimmed.seen) > MAX_SEEN_FINGERPRINTS:
         # decode() refuses a window past this bound, so mint cannot exceed it
@@ -411,7 +488,11 @@ def _endpoint_from(item: object, allowed_paths: frozenset[str]) -> EndpointState
         raise ValueError(_MALFORMED)
     if not isinstance(cursor, int) or isinstance(cursor, bool):
         raise ValueError(_MALFORMED)
-    if cursor < 0 or cursor > MAX_ENDPOINT_CURSOR:
+    # Bound the cursor in ITS path's unit. The lookup is deliberately AFTER the
+    # allow-list check above: an unknown path is already rejected by then, so a
+    # caller cannot name a path just to reach a bound, and `cursor_bound` fails
+    # closed for anything it does not recognise anyway.
+    if cursor < 0 or cursor > cursor_bound(path):
         raise ValueError(_MALFORMED)
     # `search_id` is echoed into the signed query string, so bound its length
     # and charset rather than passing an arbitrary caller string through.
@@ -425,21 +506,43 @@ def _endpoint_from(item: object, allowed_paths: frozenset[str]) -> EndpointState
                          has_more=has_more, started=started)
 
 
+def _widest_endpoint() -> EndpointState:
+    """The endpoint entry with the longest wire form `encode` can mint.
+
+    `path` and `cursor` are no longer independent: a cursor may only be as
+    large as ITS OWN path's bound, so maxing both at once would describe an
+    endpoint `encode` refuses to mint and would overstate the size cap. The
+    widest mintable entry is therefore the widest of two candidate shapes — a
+    maximum-length path at the offset bound (any path not known to page on a
+    millisecond epoch gets that bound, a 64-character one included), and each
+    ms-epoch path at the ms-epoch bound — compared on the only two fields that
+    vary, path length plus cursor digits.
+
+    Note that `encode` does not itself enforce MAX_ENDPOINT_PATH_CHARS, so the
+    64-character candidate bounds what DECODE will accept rather than what
+    `encode` can be handed. The derivation is still correct for every real
+    producer: `client.py`'s paths are module constants well under that
+    length."""
+    candidates = [('p' * MAX_ENDPOINT_PATH_CHARS, MAX_ENDPOINT_CURSOR)]
+    candidates += [(path, MAX_MS_EPOCH_CURSOR) for path in sorted(_MS_EPOCH_CURSOR_PATHS)]
+    path, cursor = max(candidates, key=lambda c: len(c[0]) + len(str(c[1])))
+    return EndpointState(path=path, cursor=cursor,
+                         search_id='s' * MAX_SEARCH_ID_CHARS,
+                         has_more=False, started=False)
+
+
 def _worst_case() -> PageToken:
     """The largest token this module can emit: every bound at its maximum.
 
     Every field's serialised length is monotone in the field, and base64 is
-    monotone in byte length, so the wire form of ANY real token is no longer
-    than the wire form of this one. `has_more`/`started` are False because
-    'false' is a character longer than 'true'."""
+    monotone in byte length, so the wire form of ANY mintable token is no
+    longer than the wire form of this one. `has_more`/`started` are False
+    because 'false' is a character longer than 'true'."""
     return PageToken(
         version=TOKEN_VERSION,
         query_hash='f' * _QUERY_HASH_CHARS,
         device_handle='f' * _DEVICE_HANDLE_CHARS,
-        endpoints=tuple(
-            EndpointState(path='p' * MAX_ENDPOINT_PATH_CHARS, cursor=MAX_ENDPOINT_CURSOR,
-                          search_id='s' * MAX_SEARCH_ID_CHARS, has_more=False, started=False)
-            for _ in range(MAX_ENDPOINTS)),
+        endpoints=(_widest_endpoint(),) * MAX_ENDPOINTS,
         seen=(b'\xff' * FINGERPRINT_BYTES,) * MAX_SEEN_FINGERPRINTS)
 
 
