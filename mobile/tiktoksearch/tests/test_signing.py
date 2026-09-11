@@ -67,8 +67,8 @@ InvalidEncryptionKey = sys.modules[Metasec.__module__].InvalidEncryptionKey
 # signer the v32 defaults below, and a test that reads `cfg.sign_*` would follow
 # a regression instead of catching it.
 V46_APP_VERSION = '46.0.42'
-V46_SDK_VERSION = 'v05.01.02-alpha.7-ov-android'
-V46_SDK_VERSION_CODE = 83952160
+V46_SDK_VERSION = 'v05.03.01-ov-android'
+V46_SDK_VERSION_CODE = 84082976
 V46_LICENSE_ID = 2142840551
 V32_APP_VERSION = '32.9.4'
 V32_SDK_VERSION = 'v04.04.09-boa-hotfix'

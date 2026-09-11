@@ -220,6 +220,97 @@ def encrypt_enc_pb(data: bytes, length: int) -> bytes:
     return data
 
 
+def has_captured_pair(dyn_seed: Optional[str], rand: Optional[int]) -> bool:
+    """True when BOTH halves of the captured `(f24 dyn_seed, f3 rand)` pair are
+    present, which is the only condition under which the corrected v46.9 argus
+    payload is emitted.
+
+    Measured 2026-09-11 on api32-core-alisg.tiktokv.com `/aweme/v1/aweme/post/`:
+    `f24` on its own is refused, and so is a freely chosen `f3` beside a good
+    `f24`. There is therefore no such thing as half a pair, and a caller holding
+    only one half gets the legacy payload rather than a signature that is
+    wrong in a way the gateway answers with an empty body.
+
+    A half pair cannot reach here from this project: `ClientConfig` refuses to
+    be constructed with one, and `identity_manager.Identity` refuses to hold
+    one, so both halves arrive together or neither does.
+    """
+    return bool(dyn_seed) and rand is not None
+
+
+def _corrected_protobuf(
+        params: bytes,
+        payload: bytes,
+        device_type: str,
+        ts: int,
+        app_version: str,
+        app_id: int,
+        license_id: int,
+        sdk_version: str,
+        sdk_version_code: int,
+        dyn_seed: str,
+        dyn_version: int,
+        rand_value: int,
+) -> bytes:
+    """The argus payload the real 46.9.1 app emits, as measured against
+    api32-core-alisg.tiktokv.com on 2026-09-11.
+
+    EVERY constant here differs from the shipped legacy payload below and each
+    one was read off a decoded app argus. Do NOT "correct" one back to the
+    legacy value: the two payloads are accepted by DIFFERENT gateways, and the
+    legacy values are kept verbatim in `generate_protobuf` for the search
+    gateway that still accepts them.
+
+    Note `app_launch_time`, `device_id` and `device_token` are absent from the
+    parameter list on purpose — see `generate_protobuf`.
+    """
+    proto = {
+        1: 0x20200929 << 1,       # f1
+        2: 2,                     # f2
+        3: rand_value << 1,       # f3 — the CAPTURED rand, also fed to dyn_encode
+        4: str(app_id),           # f4
+        6: str(license_id),       # f6
+        7: app_version,           # f7
+        8: sdk_version,           # f8
+        9: sdk_version_code << 1,  # f9
+        10: bytes(8),             # f10
+        12: ts << 1,              # f12
+        13: get_request_hash(bytearray(payload)),  # f13
+        14: get_request_hash(bytearray(params)),   # f14
+        15: {
+            1: 9 << 1,   # f15.1 — a FIXED 9; the legacy payload randomises 20..250
+            6: 3 << 1,   # f15.6 — absent from the legacy payload
+            7: ts << 1,  # f15.7 — the REQUEST ts, not app_launch_time
+        },                        # f15
+        17: ts << 1,              # f17
+        20: "none",               # f20
+        21: 312 << 1,             # f21
+        23: {
+            1: device_type,
+            2: 9 << 1,           # f23.2 — legacy sends 5
+            3: 'googleplay',
+            4: 76593152 << 1,    # f23.4 — legacy sends 209748992
+            5: 13631488 << 1,    # f23.5 — absent from the legacy payload
+        },                        # f23
+        24: dyn_seed,             # f24 — the captured seed; refused when absent
+        25: 3 << 1,               # f25 — legacy sends 1, and 5 in its dyn branch
+        26: {
+            1: dyn_version << 1,
+            # Shares ONE rand with f3 above, which is the whole point of taking
+            # `rand` as a parameter: the two are consistent by construction.
+            2: bytes.fromhex(dyn_encode(dyn_version=dyn_version, params=params,
+                                        payload=payload, rand=rand_value)),
+        },                        # f26
+        28: 5 << 1,               # f28 — legacy sends 1008
+        29: 2 << 1,               # f29 dyn_inverse_ver — legacy emits 516112 UNSHIFTED
+        30: 6 << 1,               # f30 dyn_task_req_status — legacy emits 6 UNSHIFTED
+        31: 477937796 << 1,       # f31 — legacy sends 620944317
+        33: 2 << 1,               # f33 — absent from the legacy payload
+    }
+    proto = {key: proto[key] for key in sorted(proto.keys(), reverse=False)}
+    return ProtoBuf(proto).toBuf()
+
+
 def generate_protobuf(
         params: bytes,
         payload: bytes,
@@ -235,8 +326,30 @@ def generate_protobuf(
         device_token: Optional[str],
         dyn_seed: Optional[str],
         dyn_version: Optional[int],
+        rand: Optional[int] = None,
 
 ) -> bytes:
+    """The argus protobuf for one request.
+
+    `rand` is f3 AND the `rand` handed to `dyn_encode` — one value, so the two
+    cannot drift apart. Pass the CAPTURED f3 alongside the captured f24
+    `dyn_seed` and the corrected v46.9 payload is emitted; with either half
+    missing this falls through to the payload this file has always produced,
+    `rand` drawn at random exactly as before, so the search gateway keeps
+    receiving byte-for-byte what it has been accepting.
+
+    `app_launch_time`, `device_id` (f5) and `device_token` (f16) are used by
+    the legacy payload only. The real app emits no f5 and no f16, and puts the
+    request `ts` where this file put `app_launch_time` (f15.7) — so on the
+    corrected path all three arguments are unused. They stay in the signature
+    because the legacy path still needs them.
+    """
+    if has_captured_pair(dyn_seed, rand):
+        return _corrected_protobuf(
+            params=params, payload=payload, device_type=device_type, ts=ts,
+            app_version=app_version, app_id=app_id, license_id=license_id,
+            sdk_version=sdk_version, sdk_version_code=sdk_version_code,
+            dyn_seed=dyn_seed, dyn_version=dyn_version, rand_value=rand)
     rand_value = random.randint(0, 0x7fffffff)
     proto = {
         1: 0x20200929 << 1, # f1
@@ -311,11 +424,35 @@ def mix(
         return T
 
 
+def _pad_outer(data: bytes, corrected: bool) -> bytes:
+    """Padding for the OUTER AES-CBC block.
+
+    The real 46.9.1 app writes only the pad LENGTH — in the final byte — and
+    fills the rest with random bytes. The legacy path keeps PKCS7 (N bytes each
+    equal to N), which is what this file shipped and what the search gateway
+    accepts. The INNER protobuf pad is PKCS7 on BOTH paths and is not touched
+    here; see `encode_argus_fn`'s first line.
+    """
+    if not corrected:
+        return pad(data, AES.block_size)
+    fill = AES.block_size - len(data) % AES.block_size
+    return data + secrets.token_bytes(fill - 1) + bytes([fill])
+
+
 def encode_argus_fn(
         protobuf: bytes,
-        sign_key: bytes = SIGN_KEY
+        sign_key: bytes = SIGN_KEY,
+        corrected: bool = False
 ) -> str:
+    """Encrypt one argus protobuf.
 
+    `corrected` selects the 46.9.1 app's own framing — header byte 7 and the
+    outer pad — and is set by the same captured-pair test that selects the
+    corrected protobuf, so the two halves of a signature can never be mixed.
+    """
+
+    # INNER pad: PKCS7 on both paths. The `corrected` framing applies to the
+    # OUTER AES block only (`_pad_outer`).
     protobuf = pad(protobuf, AES.block_size)
 
     length = len(protobuf)
@@ -357,7 +494,9 @@ def encode_argus_fn(
         random.randint(0x10, 0xFF),
         0x01,
         random.randint(0x10, 0xFF),
-        0x02,
+        # Byte 7 — the real 46.9.1 app sends 0x00 here; this file shipped a
+        # hardcoded 0x02, which is kept for the legacy path.
+        0x00 if corrected else 0x02,
         0x18
     ]
 
@@ -368,7 +507,7 @@ def encode_argus_fn(
 
     cipher = AES.new(aes_key, AES.MODE_CBC, aes_iv)
 
-    output = cipher.encrypt(pad(b_buffer, AES.block_size))
+    output = cipher.encrypt(_pad_outer(b_buffer, corrected))
     output = random_bytes[0:2] + output
 
     x_argus = base64.b64encode(output).decode()

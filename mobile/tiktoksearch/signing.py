@@ -27,6 +27,7 @@ import struct
 import time
 import zlib
 from dataclasses import replace
+from urllib.parse import urlsplit
 from .config import ClientConfig
 from .errors import TransportError
 # `MetasecBaseException` and `ProtoError` MUST come from the package, not from
@@ -68,6 +69,16 @@ _SIGNING_FAILURES: tuple[type[BaseException], ...] = (MetasecBaseException, Prot
 # `identities.json` is absent, so raising here would turn a missing file into a
 # startup crash. Device id only — never a cookie or token.
 LOCAL_NO_UA_MSG = ('Local v46 signer has no captured user_agent (device=%s): the User-Agent falls back to a built one quoting version_code=%s while the signature says app_version=%s. TikTok reads that app/signer version mismatch as hit_shark and answers HTTP 200 with an empty data[], which surfaces as SoftError/502 and retires the identity. Re-capture this identity WITH its user_agent.')
+DEVICE_QUERY_APP_VERSION_KEY = 'version_name'
+# Logged once per local-signer construction when the configured
+# `sign_app_version` disagrees with the app version the identity itself was
+# captured under. This is anti-block invariant (c): a signature claiming a
+# different app version than the device fingerprint is read as hit_shark, and
+# it is otherwise silent — the signature is well-formed and the reply is a
+# perfectly ordinary empty `data[]`. WARNING rather than a raise, for the same
+# reason LOCAL_NO_UA_MSG is: a synthetic identity-free client must still boot.
+# Carries two version strings and a device id — no cookie, token or pair.
+LOCAL_APP_VERSION_MISMATCH_MSG = ('Local v46 signer will sign app_version=%s while the identity (device=%s) was captured under version_name=%s. TikTok reads a signer/device version mismatch as hit_shark and answers HTTP 200 with an empty data[]. Set sign_app_version to the identity\'s own app version.')
 
 def v46_params(config: ClientConfig) -> ClientConfig:
     """`config` with its v46 `sign_*` values promoted into the four generic
@@ -89,10 +100,20 @@ def v46_params(config: ClientConfig) -> ClientConfig:
 
 class MetasecSigner:
 
-    def __init__(self, config: ClientConfig, *, launch_time: int | None=None) -> None:
+    def __init__(self, config: ClientConfig, *, launch_time: int | None=None, dyn_pair_paths: frozenset[str]=frozenset()) -> None:
         self._config = config
         self._metasec = Metasec()
         self._launch_time = launch_time or int(time.time()) - random.randint(600, 7200)
+        # The paths the captured argus pair — and therefore the corrected v46.9
+        # payload — may be used on. INJECTED by `client.py` rather than named
+        # here, for two reasons: `client` imports this module, so this module
+        # cannot import `client`'s path constants back; and the set is the SAME
+        # object that drives host routing (`client.USER_SCOPED_PATHS`, read by
+        # `_host_for`), so a path cannot end up on the user-scoped gateway with
+        # the legacy payload, or on the search gateway with the corrected one.
+        # Empty by default: a signer nobody gave the set to signs every path
+        # the way it always did.
+        self._dyn_pair_paths = dyn_pair_paths
         # Only `for_v46` flips this. Gating on the CONSTRUCTION rather than on
         # `config.cookie` is what keeps `legacy` identity-free by construction:
         # a profile that resolves to legacy while carrying identities (an
@@ -102,14 +123,21 @@ class MetasecSigner:
         self._v46 = False
 
     @classmethod
-    def for_v46(cls, config: ClientConfig, *, launch_time: int | None=None) -> 'MetasecSigner':
+    def for_v46(cls, config: ClientConfig, *, launch_time: int | None=None, dyn_pair_paths: frozenset[str]=frozenset()) -> 'MetasecSigner':
         """The signer for `signer: local` — same class, fed `v46_params`, and the
         only construction that attaches the warm identity and the v46 headers.
         Plain construction stays the v32 cold legacy path."""
-        signer = cls(v46_params(config), launch_time=launch_time)
+        signer = cls(v46_params(config), launch_time=launch_time, dyn_pair_paths=dyn_pair_paths)
         signer._v46 = True
         if not config.user_agent:
             logger.warning(LOCAL_NO_UA_MSG, config.device_id or '<synthetic>', config.version_code, config.sign_app_version)
+        # Read off the identity's OWN captured fingerprint, so the check is
+        # against what the device claims upstream rather than against another
+        # config value. Absent on a synthetic identity-free client, where there
+        # is nothing to disagree with and the check is skipped.
+        captured = (config.device_query or {}).get(DEVICE_QUERY_APP_VERSION_KEY)
+        if captured and str(captured) != config.sign_app_version:
+            logger.warning(LOCAL_APP_VERSION_MISMATCH_MSG, config.sign_app_version, config.device_id or '<synthetic>', captured)
         return signer
 
     def user_agent(self) -> str:
@@ -125,6 +153,18 @@ class MetasecSigner:
         if self._v46 and cfg.user_agent:
             return cfg.user_agent
         return f'com.zhiliaoapp.musically/{cfg.version_code} (Linux; U; Android {cfg.os_version}; en; {cfg.device_type}; Build/RP1A.200720.012; Cronet/TTNetVersion:)'
+
+    @staticmethod
+    def _request_path(url: str) -> str:
+        """The path component of a signed URL, for the per-path pair gate.
+
+        Parsed rather than string-matched so a query value that happens to
+        contain an endpoint path cannot select the corrected payload, and so a
+        malformed URL degrades to `''` — which is in no path set, i.e. it signs
+        the legacy way. `Metasec.sign` rejects a URL with no query string
+        anyway, so this never has to decide anything a real request depends on
+        beyond which payload it gets."""
+        return urlsplit(url).path
 
     def _signature(self, url: str, device_id: str, payload: bytes | None) -> dict:
         """The raw x-argus/x-ladon/x-gorgon/x-khronos quad.
@@ -146,8 +186,24 @@ class MetasecSigner:
         own message embeds the full signed query string, and `ProtoError`'s
         embeds the offending field's type."""
         cfg = self._config
+        # TWO gates, and both must pass before the corrected payload is used.
+        #
+        # (1) The captured argus pair is IDENTITY material, so it rides on the
+        #     `for_v46` construction only — the same rule the cookie, token and
+        #     captured UA follow, and for the same reason: a `legacy` signer
+        #     must keep signing exactly what it signed before the pair existed.
+        # (2) PER PATH. The pair buys entry to the user-scoped gateway and
+        #     nothing else. `/search` lives on a different gateway where the
+        #     LEGACY payload is measured to work, and no measurement says the
+        #     corrected one is accepted there — so an identity that happens to
+        #     carry a pair must not silently re-sign the one path that already
+        #     works. Anything off `_dyn_pair_paths` signs exactly as it did
+        #     before the pair existed.
+        use_pair = self._v46 and self._request_path(url) in self._dyn_pair_paths
+        dyn_seed = cfg.dyn_seed if use_pair else None
+        dyn_rand = cfg.dyn_rand if use_pair else None
         try:
-            sig = self._metasec.sign(url=url, app_id=cfg.app_id, app_version=cfg.app_version, app_launch_time=self._launch_time, device_type=cfg.device_type, sdk_version=cfg.sdk_version, sdk_version_code=cfg.sdk_version_code, license_id=cfg.license_id, device_id=device_id, device_token='', payload=payload.hex() if isinstance(payload, (bytes, bytearray)) else payload)
+            sig = self._metasec.sign(url=url, app_id=cfg.app_id, app_version=cfg.app_version, app_launch_time=self._launch_time, device_type=cfg.device_type, sdk_version=cfg.sdk_version, sdk_version_code=cfg.sdk_version_code, license_id=cfg.license_id, device_id=device_id, device_token='', dyn_seed=dyn_seed, dyn_version=cfg.dyn_version, rand=dyn_rand, payload=payload.hex() if isinstance(payload, (bytes, bytearray)) else payload)
         except _SIGNING_FAILURES as exc:
             raise TransportError(f'local signer failed to produce headers: {type(exc).__name__}') from exc
         missing = [k for k in SIGNATURE_KEYS if k not in sig]

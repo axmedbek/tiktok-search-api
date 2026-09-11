@@ -4,10 +4,10 @@ import random
 import time
 import urllib.parse
 from dataclasses import dataclass, replace
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 import requests
 from .config import SIGNER_LOCAL, SIGNER_RAPID, ClientConfig
-from .errors import NotFound, RateLimited, SoftError, TransportError
+from .errors import GatewayRefused, NotFound, RateLimited, SoftError, TransportError
 from .filters import SearchKind, SearchPage, SearchQuery
 from .mapping import flatten_profile, flatten_user, flatten_video
 from .paging import EndpointState, PageToken, SeenWindow, cursor_bound, sanitize_search_id
@@ -17,10 +17,18 @@ logger = logging.getLogger('tiktoksearch.client')
 SEARCH_VIDEO_PATH = '/aweme/v1/general/search/single/'
 SEARCH_ITEM_PATH = '/aweme/v1/search/item/'
 SEARCH_USER_PATH = '/aweme/v1/discover/search/'
-# One user's profile, and that user's own posts. Both key on `sec_user_id`:
-# `user_id` alone answers empty. UNVERIFIED against a capture in this repo —
-# see the plan's open item, settled by the first live call.
-USER_PROFILE_PATH = '/aweme/v1/user/profile/other/'
+# One user's profile, and that user's own posts. Both are USER-SCOPED and both
+# are served by `posts_host`, not `search_host` — see `_host_for`.
+#
+# The profile path is the app's own spelling, captured 2026-09-11. It is NOT
+# `/aweme/v1/user/profile/other/`, which this module carried unverified and
+# which no capture supports. Correcting the constant does not make the endpoint
+# work: the app's own request, on a signature measured good on the posts path
+# in the same session, is refused there with a zero-byte 200. That is a
+# separate, open problem.
+#
+# The posts path keys on `user_id` ALONE — measured, see `_posts_params`.
+USER_PROFILE_PATH = '/tiktok/user/profile/other/v1'
 USER_POSTS_PATH = '/aweme/v1/aweme/post/'
 # The three SEARCH endpoint paths, and the allow-list a `/search` page_token is
 # decoded against — narrower than ENDPOINT_PATHS on purpose: a search token has
@@ -32,6 +40,12 @@ SEARCH_PATHS: frozenset[str] = frozenset((SEARCH_VIDEO_PATH, SEARCH_ITEM_PATH, S
 # hands `paging.decode` the narrowest list that covers its own token; this is
 # the whole set those lists are drawn from.
 ENDPOINT_PATHS: frozenset[str] = SEARCH_PATHS | frozenset((USER_PROFILE_PATH, USER_POSTS_PATH))
+# The paths served by `posts_host` rather than `search_host`. Split off
+# ENDPOINT_PATHS because the split IS the routing rule: the two search gateways
+# and the user-scoped gateway are different hosts, and `search_host` 404s
+# everything that is not a search path (measured 2026-09-10). `/search` stays on
+# `search_host`, where it works and where nothing in this Epic touches it.
+USER_SCOPED_PATHS: frozenset[str] = ENDPOINT_PATHS - SEARCH_PATHS
 # Merged video search: the general "Top" endpoint plus the Videos-tab endpoint.
 _VIDEO_ENDPOINTS = ((SEARCH_VIDEO_PATH, 'data'), (SEARCH_ITEM_PATH, 'search_item_list'))
 # Every key a search reply can put its items under. Used only to answer "did
@@ -75,6 +89,15 @@ NO_SUCH_USER_STATUSES: frozenset[int] = frozenset((2053, 10202))
 # Client-facing failure text. Terse, and carrying no upstream message, no ids
 # and nothing about the identity that served the request.
 NO_SUCH_USER_MSG = 'no such user'
+# The gateway answered HTTP 200 with a zero-length body. Deliberately says only
+# that, because only that was observed — it is neither risk-control nor proof of
+# a bad signature (see `errors.GatewayRefused`). Carries no host, path or id.
+GATEWAY_REFUSED_MSG = 'the endpoint gateway accepted the request and returned nothing'
+# The response header TikTok's user-scoped gateway sets on that refusal. Read
+# ONLY to put a value in the log line: the classification is made on the
+# zero-length body, so a renamed header degrades the diagnostic, never the
+# behaviour.
+ORCAS_HEADER = 'tt_orcas_res'
 UNUSABLE_PROFILE_MSG = 'the profile reply carried no usable user id'
 UNUSABLE_IDS_MSG = 'the user-search reply carried no usable ids for this username'
 
@@ -160,6 +183,13 @@ MAX_PAGES_PER_ENDPOINT = 40
 POSTS_SOURCE = '0'
 POSTS_PAGE_COUNT = 20
 ADDRESS_BOOK_ACCESS = '0'
+# One search page's `count`. The direct path asks for 10 because 20 makes the
+# merged search endpoints answer `has_more=false` early; the cold legacy path
+# keeps the 20 it always sent. Named because `capture_diff.expected_params`
+# reads them: a literal here would have to be restated there, and a restated
+# param value is exactly the drift that tool exists to detect.
+DIRECT_PAGE_COUNT = 10
+LEGACY_PAGE_COUNT = 20
 # `max_cursor=0` asks for the newest posts. The endpoint has no offset
 # semantics, so this is a start marker, not an offset.
 POSTS_START_CURSOR = 0
@@ -274,6 +304,48 @@ def _user_search_params(keyword: str, cursor: int, count: int) -> dict:
     return {'keyword': keyword, 'count': str(count), 'cursor': str(cursor), 'type': '1', 'search_source': 'normal_search'}
 
 
+def _video_search_params(keyword: str, cursor: int, count: int, filter_params: Mapping[str, str]) -> dict:
+    """Query params for one page of the video-search endpoints. Shared by both
+    merged endpoints (`single/` + `search/item/`, which send the same params)
+    and, like every builder here, by `capture_diff.expected_params` — so the
+    param diff is taken against what this client really sends, never a copy."""
+    params = {'keyword': keyword, 'count': str(count), 'offset': str(cursor), 'search_source': 'normal_search'}
+    params.update(filter_params)
+    return params
+
+
+def _profile_params(user_id: str, sec_uid: str) -> dict:
+    """Query params for one profile lookup. Both ids go out because the
+    endpoint keys on `sec_user_id` and `user_id` alone answers empty."""
+    return {'user_id': user_id, 'sec_user_id': sec_uid, 'address_book_access': ADDRESS_BOOK_ACCESS}
+
+
+def _posts_params(user_id: str, cursor: int, count: int) -> dict:
+    """Query params for one page of a user's own post grid. `max_cursor` is a
+    millisecond epoch that runs BACKWARDS (newest first), not an offset.
+
+    NO `sec_user_id`, and that is measured, not tidiness. The app's own working
+    request omits it and the endpoint keys on `user_id`; sending an unvalidated
+    76-character feed-sourced sec_uid beside a `user_id` that on its own serves
+    posts got a zero-byte refusal (2026-09-11, Arm M). Since the endpoint does
+    not need it, the safe param set is the one the app actually sends. A
+    profile-sourced, full-length sec_uid may well be accepted — nobody has
+    measured that, and guessing here costs a whole endpoint."""
+    return {'source': POSTS_SOURCE, 'user_id': user_id, 'max_cursor': str(cursor), 'count': str(count)}
+
+
+def _host_for(cfg: ClientConfig, path: str) -> str:
+    """Which configured host serves `path` on the direct route.
+
+    One rule, in one place, keyed on the path — because there is no single
+    direct host: `search_host` serves the three search paths and 404s the
+    user-scoped ones, and `posts_host` is the gateway the real app calls those
+    on. An unknown path resolves to `search_host`, which is where every direct
+    request went before this function existed, so nothing off the two lists
+    changes behaviour by being added."""
+    return cfg.posts_host if path in USER_SCOPED_PATHS else cfg.search_host
+
+
 def _posts_seed(token: Optional[PageToken]) -> EndpointState:
     """Resume state for the posts endpoint: the token's entry when it has one,
     else an unopened stream at the newest post. There is no legacy bare
@@ -311,7 +383,11 @@ class TikTokClient:
         if self._mode == SIGNER_RAPID:
             self._signer = RapidSigner(config)
         elif self._mode == SIGNER_LOCAL:
-            self._signer = signer or MetasecSigner.for_v46(config)
+            # The corrected-argus path set is handed over here so it stays the
+            # SAME set that `_host_for` routes on: a user-scoped path gets the
+            # user-scoped host and the corrected payload together, by
+            # construction, and a search path gets neither.
+            self._signer = signer or MetasecSigner.for_v46(config, dyn_pair_paths=USER_SCOPED_PATHS)
         else:
             self._signer = signer or MetasecSigner(config)
         # Lazily built, and only ever by _rapid_fallback.
@@ -329,9 +405,7 @@ class TikTokClient:
         filter_params = query.filters.to_query_params()
 
         def build(offset: int, count: int) -> dict:
-            params = {'keyword': query.keyword, 'count': str(count), 'offset': str(offset), 'search_source': 'normal_search'}
-            params.update(filter_params)
-            return params
+            return _video_search_params(query.keyword, offset, count, filter_params)
 
         def unwrap(item: dict) -> Optional[dict]:
             return item.get('aweme_info') or item.get('aweme') or (item if item.get('aweme_id') else None)
@@ -449,7 +523,7 @@ class TikTokClient:
         # MAX_ENDPOINT_CURSOR, so this is exactly the bound applied before.
         bound = cursor_bound(path)
         # direct mode paginates deeper with count=10 (count=20 returns has_more=false early)
-        page_count = 10 if self._direct else 20
+        page_count = DIRECT_PAGE_COUNT if self._direct else LEGACY_PAGE_COUNT
         pages = 0
         budget = _page_budget(limit, page_count)
         while len(out) < limit:
@@ -641,11 +715,12 @@ class TikTokClient:
     def profile_from_search(self, username: str) -> dict:
         """`username`'s flattened profile, in exactly ONE signed request.
 
-        Read off the USER-SEARCH node, because `/aweme/v1/user/profile/other/`
-        cannot serve this client as it signs it (measured: HTTP 404 from the
-        search host, a zero-length 200 on every general API host). `profile()`
-        below stays in the tree as the upgrade path for when a capture settles
-        that param set; this is what `POST /profile` actually calls.
+        Read off the USER-SEARCH node, because the profile endpoint cannot
+        serve this client as it signs it (measured: HTTP 404 from the search
+        host, a zero-length 200 on every general API host — and, on the app's
+        OWN path and host with the app's OWN valid signature, a zero-length 200
+        again). `profile()` below stays in the tree as the upgrade path for
+        when that is settled; this is what `POST /profile` actually calls.
 
         The node carries every profile field except `signature` and
         `region_code`, which are structurally ABSENT from it and are therefore
@@ -679,7 +754,7 @@ class TikTokClient:
         unconditionally — this service never has a contact book to offer.
         """
         params = self._common_params()
-        params.update({'user_id': user_id, 'sec_user_id': sec_uid, 'address_book_access': ADDRESS_BOOK_ACCESS})
+        params.update(_profile_params(user_id, sec_uid))
         data = self._get_signed(USER_PROFILE_PATH, params, shape=PROFILE_PAYLOAD)
         user = data.get('user')
         record = flatten_profile(user) if isinstance(user, dict) else None
@@ -712,12 +787,19 @@ class TikTokClient:
         `PageToken` machinery as search, with `search_id=''`: this endpoint is
         not a search session, it pages on TikTok's own `max_cursor` alone, so
         there is no session handle to echo and nothing to carry there.
+
+        `sec_uid` is ACCEPTED and deliberately NOT SENT. It stays in the
+        signature because a caller resolving a user holds both ids as one unit
+        (`resolve_user` returns the pair) and the endpoint contract answers
+        both back; it is not forwarded because the app's own working request
+        omits it and an unvalidated one was measured to get the request refused
+        — see `_posts_params`.
         """
         state = _posts_seed(page_token)
         seen = SeenWindow(page_token.seen if page_token is not None else ())
         out: list[dict] = []
         if state.has_more:
-            end = self._paginate_posts(out=out, seen=seen, user_id=user_id, sec_uid=sec_uid, limit=limit, start_cursor=state.cursor)
+            end = self._paginate_posts(out=out, seen=seen, user_id=user_id, limit=limit, start_cursor=state.cursor)
         else:
             # Exhausted by an earlier request: re-querying the tail spends a
             # signed request (a PAID one under `signer: rapid`) to be told the
@@ -728,7 +810,7 @@ class TikTokClient:
             end = PageEnd(has_more=False, cursor=state.cursor, search_id='')
         return SearchPage(records=out, cursor=state.cursor, next_cursor=end.cursor if end.has_more else None, has_more=end.has_more, endpoints=(EndpointState(path=USER_POSTS_PATH, cursor=end.cursor, search_id='', has_more=end.has_more, started=True),), seen=seen.recent())
 
-    def _paginate_posts(self, *, out: list[dict], seen: SeenWindow, user_id: str, sec_uid: str, limit: int, start_cursor: int) -> PageEnd:
+    def _paginate_posts(self, *, out: list[dict], seen: SeenWindow, user_id: str, limit: int, start_cursor: int) -> PageEnd:
         """Page the posts endpoint on `max_cursor`, appending unique records
         into `out`/`seen`.
 
@@ -781,7 +863,7 @@ class TikTokClient:
             pages += 1
             prev_cursor = cursor
             params = self._common_params()
-            params.update({'source': POSTS_SOURCE, 'user_id': user_id, 'sec_user_id': sec_uid, 'max_cursor': str(cursor), 'count': str(POSTS_PAGE_COUNT)})
+            params.update(_posts_params(user_id, cursor, POSTS_PAGE_COUNT))
             data = self._get_signed(USER_POSTS_PATH, params, shape=POSTS_PAYLOAD)
             # `aweme_list` PRESENT but empty is an ordinary page (private
             # account, no posts, end of stream) — POSTS_PAYLOAD already
@@ -908,7 +990,7 @@ class TikTokClient:
         last_err: Exception | None = None
         for attempt in range(cfg.retries + 1):
             if self._direct:
-                host = cfg.search_host
+                host = _host_for(cfg, path)
             else:
                 host = cfg.api_hosts[attempt % len(cfg.api_hosts)]
             url = host + path + '?' + urllib.parse.urlencode(params)
@@ -922,6 +1004,21 @@ class TikTokClient:
                 continue
             if resp.status_code == 429:
                 raise RateLimited('TikTok rate-limited this request')
+            if resp.status_code == 200 and not resp.content:
+                # ITS OWN condition, not "bad response" and emphatically not
+                # hit_shark: the gateway answered, and answered with nothing.
+                # Risk-control never looks like this — it sends a JSON body
+                # with `status_code: 0` and an empty list. Naming it honestly
+                # is the point (see `errors.GatewayRefused`); the one thing
+                # this log must never do is imply a cause, because the same
+                # shape has been measured on a signature known to be good.
+                # `GatewayRefused` is a `TransportError`, so it costs the
+                # identity no health, exactly as the zero-length 200 did
+                # before it had a name.
+                last_err = GatewayRefused(GATEWAY_REFUSED_MSG)
+                logger.warning('gateway refused the request (attempt %d, device=%s, path=%s, %s=%s): HTTP 200 with a zero-length body — the request reached the gateway and was refused; NOT risk-control and not by itself a signature verdict', attempt, self.device_id, path, ORCAS_HEADER, resp.headers.get(ORCAS_HEADER) or 'absent')
+                time.sleep(0.5 * (attempt + 1))
+                continue
             if resp.status_code != 200 or not resp.content:
                 last_err = TransportError(f'HTTP {resp.status_code} len {len(resp.content)}')
                 logger.warning('bad response (attempt %d): %s', attempt, last_err)
@@ -1001,6 +1098,11 @@ class TikTokClient:
                     time.sleep(0.5 * (attempt + 1))
                     continue
             return data
-        if isinstance(last_err, (RateLimited, SoftError)):
+        if isinstance(last_err, (RateLimited, SoftError, GatewayRefused)):
+            # `GatewayRefused` is raised as ITSELF rather than being rewrapped
+            # in a generic TransportError below: a diagnosis that only survives
+            # to the end of the retry loop is not a diagnosis. Callers that
+            # never learned the class still see a TransportError, because that
+            # is what it is.
             raise last_err
         raise TransportError(f'request failed after {cfg.retries + 1} attempts: {last_err}')

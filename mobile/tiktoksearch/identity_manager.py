@@ -33,6 +33,9 @@ logger = logging.getLogger('tiktoksearch.identity')
 
 # Consecutive empty/shadow-blocked results before an identity is retired.
 DEFAULT_STALE_AFTER = 3
+# The captured argus pair, named as one unit because that is what it is: the
+# two halves are only ever carried, compared and rejected together.
+DYN_PAIR_FIELDS: tuple[str, str] = ('dyn_seed', 'dyn_rand')
 
 
 @dataclass
@@ -45,11 +48,32 @@ class Identity:
     x_tt_token: str | None = None
     user_agent: str | None = None
     device_query: Mapping[str, Any] = field(default_factory=dict)
+    # The captured argus `(f24 dyn_seed, f3 rand)` pair. SECRET, same class as
+    # `cookie`: never logged, never echoed, masked first6…last4 if a diagnostic
+    # must name it. Optional — an identity without one is a perfectly good
+    # identity and every existing path works unchanged; what is NOT a thing is
+    # HALF a pair (see __post_init__).
+    dyn_seed: str | None = None
+    dyn_rand: int | None = None
     # health
     consecutive_empty: int = 0
     stale: bool = False
     last_ok: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Refuse a HALF pair, so no half-paired identity can exist.
+
+        A `dyn_seed` with no `dyn_rand` is a configuration error, not a
+        half-usable identity: a good f24 beside a freely chosen f3 was MEASURED
+        to be refused with a zero-byte body, so a half pair is not "the pair,
+        degraded" — it is a broken identity that looks configured. `IdentityStore`
+        turns this into a loud ERROR and drops that ENTRY, never a silent
+        downgrade to no-pair. The message names the identity key and neither
+        half of the pair."""
+        if bool(self.dyn_seed) != (self.dyn_rand is not None):
+            have, missing = DYN_PAIR_FIELDS if self.dyn_seed else DYN_PAIR_FIELDS[::-1]
+            raise ValueError(f'identity {self.key}: {have} is set without {missing} — the captured argus pair is one unit, carry both or neither')
 
     def overrides(self) -> dict[str, Any]:
         """Fields to feed into ClientConfig.with_overrides for this identity."""
@@ -62,7 +86,16 @@ class Identity:
             out['user_agent'] = self.user_agent
         if self.device_query:
             out['device_query'] = dict(self.device_query)
+        if self.dyn_seed:
+            # Both, always: __post_init__ has already proven they travel
+            # together, and `ClientConfig` would reject a half pair anyway.
+            out['dyn_seed'] = self.dyn_seed
+            out['dyn_rand'] = self.dyn_rand
         return out
+
+    def has_dyn_pair(self) -> bool:
+        """Whether this identity can sign the user-scoped endpoints."""
+        return bool(self.dyn_seed)
 
     def report_ok(self) -> None:
         with self._lock:
@@ -89,6 +122,23 @@ class Identity:
             return not self.stale
 
 
+def _dyn_rand(entry: Mapping[str, Any]) -> int | None:
+    """The entry's `dyn_rand` (argus f3) as an int, or None when absent.
+
+    Coerced here, at the file boundary, because JSON may carry it quoted and
+    the value is shifted into a protobuf varint downstream. A non-numeric value
+    raises `ValueError`, which `reload` reports the same way it reports a half
+    pair — the entry is dropped, never silently un-paired. The message is
+    built from the field name only; the value never appears in it."""
+    raw = entry.get('dyn_rand')
+    if raw is None or raw == '':
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError('dyn_rand is not an integer') from None
+
+
 def _identity_key(entry: Mapping[str, Any]) -> str:
     dq = entry.get('device_query') or {}
     return str(entry.get('device_id') or dq.get('device_id') or '')
@@ -100,12 +150,19 @@ class IdentityStore:
     File format — a list of identity objects, or {"identities": [...]}:
         [
           {"device_id": "...", "iid": "...", "cookie": "...",
-           "x_tt_token": "...", "user_agent": "...", "device_query": {...}}
+           "x_tt_token": "...", "user_agent": "...", "device_query": {...},
+           "dyn_seed": "...", "dyn_rand": 123}
         ]
+
+    `dyn_seed`/`dyn_rand` are the captured argus `(f24, f3)` pair and are
+    OPTIONAL — an entry without them is a normal identity and every path that
+    worked before works unchanged. They are a PAIR: an entry carrying one
+    without the other is dropped with an ERROR, not loaded half-configured.
 
     Health (consecutive_empty / stale) is preserved across reloads for identities
     whose key (device_id) is unchanged, so a no-op rewrite doesn't reset counters,
-    but an entry with a NEW cookie/token is treated as refreshed (health reset)."""
+    but an entry with NEW credentials — cookie, x_tt_token or the argus pair —
+    is treated as refreshed (health reset)."""
 
     def __init__(self, path: str | os.PathLike[str], *,
                  stale_after: int = DEFAULT_STALE_AFTER) -> None:
@@ -155,28 +212,45 @@ class IdentityStore:
                     continue
                 cookie = entry.get('cookie')
                 token = entry.get('x_tt_token')
-                ident = Identity(
-                    key=key,
-                    device_id=key,
-                    iid=str(entry.get('iid') or (entry.get('device_query') or {}).get('iid') or ''),
-                    cookie=cookie, x_tt_token=token,
-                    user_agent=entry.get('user_agent'),
-                    device_query=entry.get('device_query') or {},
-                )
+                try:
+                    ident = Identity(
+                        key=key,
+                        device_id=key,
+                        iid=str(entry.get('iid') or (entry.get('device_query') or {}).get('iid') or ''),
+                        cookie=cookie, x_tt_token=token,
+                        user_agent=entry.get('user_agent'),
+                        device_query=entry.get('device_query') or {},
+                        dyn_seed=entry.get('dyn_seed') or None,
+                        dyn_rand=_dyn_rand(entry),
+                    )
+                except ValueError as exc:
+                    # A half pair, or a `dyn_rand` that is not a number. The
+                    # ENTRY is dropped rather than degraded to no-pair: the
+                    # file says this identity carries the pair and it does not,
+                    # so serving it as if it never claimed one would hide the
+                    # error behind a working search path. Loud, keyed, and
+                    # carrying no value from the file.
+                    logger.error('skipping identity %s: %s', key, exc)
+                    continue
                 prev = old.get(key)
                 # Carry health forward only if the credentials are unchanged;
-                # a new cookie/token means the identity was refreshed → start fresh.
-                if prev is not None and prev.cookie == cookie and prev.x_tt_token == token:
+                # a new cookie/token/pair means the identity was refreshed → start fresh.
+                if (prev is not None and prev.cookie == cookie and prev.x_tt_token == token
+                        and prev.dyn_seed == ident.dyn_seed and prev.dyn_rand == ident.dyn_rand):
                     ident.consecutive_empty = prev.consecutive_empty
                     ident.stale = prev.stale
                     ident.last_ok = prev.last_ok
                 elif prev is not None:
-                    logger.info('identity %s refreshed (new cookie/token) — health reset', key)
+                    logger.info('identity %s refreshed (new credentials) — health reset', key)
                 new[key] = ident
             self._identities = new
             self._mtime = mtime
-        logger.info('loaded %d warm identit(y/ies) from %s (%d usable)',
-                    len(entries), self._path, self.usable_count())
+        # The LOADED count, not the entry count: an entry can be skipped (no
+        # device_id, or a half argus pair), and reporting the file's length
+        # would say 3 while serving 2 — the skip is already an ERROR line, and
+        # this line must not contradict it.
+        logger.info('loaded %d warm identit(y/ies) of %d entries from %s (%d usable)',
+                    len(self._identities), len(entries), self._path, self.usable_count())
         return True
 
     # ---- access ------------------------------------------------------------

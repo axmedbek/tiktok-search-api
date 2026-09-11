@@ -17,6 +17,20 @@ Usage:
 fingerprint (cdid, openudid, region, mcc_mnc, ...) captured once; the addon merges
 the live per-request bits (device_id, iid, x-tt-token, cookie) on top and only
 rewrites the file when the identity actually changed.
+
+`dyn_pair` (optional) is a JSON file holding the captured argus pair
+`{"dyn_seed": "<f24>", "dyn_rand": <f3>}`, which the user-scoped endpoints
+(`/aweme/v1/aweme/post/`) require and the search path does not. It is supplied
+as a FILE rather than read off the wire because the pair lives inside the
+encrypted `x-argus` header: recovering it means decrypting that header with the
+sign key, which needs pycryptodome + gmssl, and this addon is deliberately
+stdlib-only at import time so mitmdump can load it in any environment. The
+addon's job is to carry the pair into `identities.json` beside the cookie it
+belongs with, and to rewrite the file when either changes.
+
+The pair is the SAME CLASS OF SECRET as the cookie: it is never logged and
+never echoed. An entry carrying one half without the other is rejected by
+`identity_manager`, so this addon writes both or neither.
 """
 from __future__ import annotations
 
@@ -38,6 +52,7 @@ class IdentityCapture:
     def __init__(self) -> None:
         self._out = 'identities.json'
         self._base_query: dict = {}
+        self._dyn_pair: dict = {}
         self._last_written: dict | None = None
 
     def load(self, loader) -> None:
@@ -45,6 +60,8 @@ class IdentityCapture:
                           'Path to write the captured identities.json')
         loader.add_option('base_device_query', str, '',
                           'Optional JSON file with the static warm device_query fingerprint')
+        loader.add_option('dyn_pair', str, '',
+                          'Optional JSON file with the captured argus pair {dyn_seed, dyn_rand}')
 
     def configure(self, updated) -> None:
         self._out = ctx.options.identities_out or 'identities.json'
@@ -56,6 +73,7 @@ class IdentityCapture:
                 logger.info('loaded base device_query (%d keys) from %s', len(self._base_query), path)
             except (OSError, ValueError) as exc:
                 logger.error('failed to read base_device_query %s: %s', path, exc)
+        self._dyn_pair = self._read_dyn_pair(ctx.options.dyn_pair)
         # seed _last_written from an existing file so we don't rewrite on startup
         if os.path.exists(self._out):
             try:
@@ -65,6 +83,36 @@ class IdentityCapture:
                     self._last_written = data[0]
             except (OSError, ValueError):
                 pass
+
+    def _read_dyn_pair(self, path: str) -> dict:
+        """The captured argus pair from `path`, or {} when not configured.
+
+        Both halves or neither: a file naming only one is a configuration
+        error and is refused here rather than written into identities.json,
+        where `identity_manager` would drop the whole identity. Nothing from
+        the file reaches the log — only the field names and the path do.
+        """
+        if not path:
+            return {}
+        if not os.path.exists(path):
+            logger.error('dyn_pair file %s not found — identities are written without the argus pair', path)
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f) or {}
+            seed = data.get('dyn_seed') or None
+            rand = data.get('dyn_rand')
+            rand = int(rand) if rand not in (None, '') else None
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error('failed to read dyn_pair %s: %s', path, type(exc).__name__)
+            return {}
+        if bool(seed) != (rand is not None):
+            logger.error('dyn_pair %s carries only one of dyn_seed/dyn_rand — the argus pair is one unit, so neither is written', path)
+            return {}
+        if seed is None:
+            return {}
+        logger.info('loaded the captured argus pair from %s', path)
+        return {'dyn_seed': seed, 'dyn_rand': rand}
 
     def request(self, flow: http.HTTPFlow) -> None:
         host = flow.request.pretty_host or ''
@@ -104,6 +152,8 @@ class IdentityCapture:
             'user_agent': headers.get('user-agent') or headers.get('User-Agent'),
             'device_query': device_query,
         }
+        # Both keys or neither — never one (identity_manager drops a half pair).
+        identity.update(self._dyn_pair)
         self._maybe_write(identity)
 
     def _maybe_write(self, identity: dict) -> None:
@@ -112,7 +162,12 @@ class IdentityCapture:
         if self._last_written is not None:
             same = (self._last_written.get('device_id') == identity['device_id']
                     and self._last_written.get('cookie') == identity['cookie']
-                    and self._last_written.get('x_tt_token') == identity['x_tt_token'])
+                    and self._last_written.get('x_tt_token') == identity['x_tt_token']
+                    # A re-captured argus pair is a credential change like any
+                    # other: without this the file keeps the stale pair until
+                    # the cookie happens to rotate.
+                    and self._last_written.get('dyn_seed') == identity.get('dyn_seed')
+                    and self._last_written.get('dyn_rand') == identity.get('dyn_rand'))
             if same:
                 return
         tmp = self._out + '.tmp'
@@ -124,10 +179,13 @@ class IdentityCapture:
             logger.error('failed to write %s: %s', self._out, exc)
             return
         self._last_written = identity
-        logger.info('captured fresh identity device_id=%s token=%s cookie_sessionid=%s -> %s',
+        # Secrets are masked or reduced to a yes/no; the argus pair is reported
+        # only as present/absent, never as a value, not even masked.
+        logger.info('captured fresh identity device_id=%s token=%s cookie_sessionid=%s argus_pair=%s -> %s',
                     identity['device_id'],
                     _mask(identity['x_tt_token']),
                     'yes' if _has_sessionid(identity['cookie']) else 'no',
+                    'yes' if identity.get('dyn_seed') else 'no',
                     self._out)
 
 

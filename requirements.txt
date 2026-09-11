@@ -5,3 +5,4 @@ PyYAML
 fastapi
 uvicorn
 pydantic>=2
+pika

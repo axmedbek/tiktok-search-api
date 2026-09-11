@@ -60,6 +60,7 @@ from conftest import (  # noqa: E402
 
 from tiktoksearch.api import app as app_module  # noqa: E402
 from tiktoksearch.api.schemas import (  # noqa: E402
+    DEFAULT_POSTS_PERIOD,
     MAX_SEC_UID_CHARS,
     MAX_USER_ID_CHARS,
     MAX_USERNAME_CHARS,
@@ -80,6 +81,7 @@ from tiktoksearch.errors import (  # noqa: E402
     SoftError,
     TransportError,
 )
+from tiktoksearch.filters import SearchFilters  # noqa: E402
 from tiktoksearch.identity_manager import DEFAULT_STALE_AFTER  # noqa: E402
 from tiktoksearch.mapping import flatten_user, flatten_video  # noqa: E402
 from tiktoksearch.paging import (  # noqa: E402
@@ -205,12 +207,27 @@ def _park_almost_stale(store, device: str = DEVICE_A) -> None:
 
 
 # -------------------------------------------------------- transport scripting
+def _resolve_reply(nickname: str = HANDLE) -> dict:
+    """The user-search answer a `/user/posts` FIRST PAGE resolves the handle
+    against, for the account's display name.
+
+    `nickname` is the handle by default, so `_posts_keywords` derives the
+    handle keyword ALONE — one search per page, which is what every assertion
+    in this file about pages, tokens and cap units was written against. A test
+    about the display-name keyword passes a different nickname."""
+    return user_search_reply([profile_node(nickname=nickname)])
+
+
 def _by_path(transport: FakeTransport, mapping) -> None:
     """Answer each signed path from `mapping` (a reply dict, or a callable over
     the recorded call). A keyword search drives BOTH merged video endpoints, so
-    a posts page normally needs an answer for each."""
+    a posts page normally needs an answer for each — and a first page resolves
+    the handle first, so the user-search answer is supplied by default and may
+    be overridden."""
+    answers = {SEARCH_USER_PATH: _resolve_reply(), **mapping}
+
     def handler(call):
-        answer = mapping[call['path']]
+        answer = answers[call['path']]
         return answer(call) if callable(answer) else dict(answer)
 
     transport.script(handler)
@@ -230,14 +247,21 @@ def _single_page(transport: FakeTransport, items) -> None:
 
 
 def _pages(transport: FakeTransport, *replies) -> None:
-    """Answer the Nth signed request with the Nth reply (the last one repeats).
+    """Answer the Nth signed SEARCH request with the Nth reply (the last one
+    repeats).
 
     Paired with `limit=1`, where one posts page drives exactly ONE endpoint for
-    exactly one inner page — so request N is page N of the chain, and the
-    Videos-tab endpoint is never opened."""
+    exactly one inner page — so search request N is page N of the chain, and
+    the Videos-tab endpoint is never opened.
+
+    The handle RESOLVE is answered separately and does NOT consume an index: it
+    is not part of the page chain, and letting it eat `replies[0]` would shift
+    every page of every chain by one."""
     served = {'n': 0}
 
     def handler(call):
+        if call['path'] == SEARCH_USER_PATH:
+            return _resolve_reply()
         index = min(served['n'], len(replies) - 1)
         served['n'] += 1
         answer = replies[index]
@@ -257,9 +281,14 @@ def _blocks(call) -> dict:
 def _posts_token(*endpoints: EndpointState, device: str = DEVICE_A,
                  handle: str = HANDLE) -> str:
     """A `/user/posts` token this server instance would accept — minted through
-    the app's OWN `_posts_query_hash`, exactly as `_mint_posts_token` does."""
+    the app's OWN `_posts_query_hash`, exactly as `_mint_posts_token` does,
+    under the DEFAULT `period` (the window a request that names none searches).
+    The window is part of the hash, so a token minted under another one is
+    rejected — which is what stops a token resuming a different query than it
+    was minted for."""
     return encode(PageToken(version=TOKEN_VERSION,
-                            query_hash=app_module._posts_query_hash(handle),
+                            query_hash=app_module._posts_query_hash(
+                                handle, SearchFilters(publish_time=DEFAULT_POSTS_PERIOD)),
                             device_handle=device_handle(device),
                             endpoints=endpoints or (_resumable_primary(),)))
 
@@ -486,10 +515,15 @@ class TestPostsContinuation:
         assert _ids(first) == ['1']
         # Seeded dedup: '1' is gone, only the fresh record comes back.
         assert _ids(second) == ['2']
-        # A search session lives on ONE device, so page 2 is pinned to it —
-        # asserted on the label AND on the device_id that actually signed.
-        assert second['device'] == first['device']
-        assert len({call['device'] for call in transport.calls}) == 1
+        # A search session lives on ONE device, so page 2 is pinned to the
+        # device that served page 1's SEARCH — asserted on the label AND on the
+        # device_id that actually signed. Read off the SEARCH calls and off the
+        # last `+`-joined label, never off every call the page made: page 1's
+        # handle resolve is an INDEPENDENT pooled call and on a two-device pool
+        # lands on the other device, which is why `device` is `+`-joined at all.
+        assert second['device'] == first['device'].split('+')[-1]
+        assert len({call['device'] for call in transport.calls
+                    if call['path'] in (SEARCH_VIDEO_PATH, SEARCH_ITEM_PATH)}) == 1
 
     def test_the_posts_token_is_case_insensitive_on_the_handle(
             self, tmp_path, transport):
@@ -853,11 +887,15 @@ class TestTheGeneratedSchemaMarksTheInterimFieldsRequired:
         assert body['complete'] is False
 
 
-# ================================================== 17: one cap unit per page
-class TestTheDailyCapIsChargedOncePerPage:
-    """The cap is charged per `run_call`, so a handler that stacked a resolve
-    into the same call would ride one cap unit for two signed requests and
-    break the plan's own cost model."""
+# ============================================== 17: one cap unit per pooled call
+class TestTheDailyCapIsChargedPerPooledCall:
+    """The cap is charged per `run_call`, so a handler that stacked several
+    logical calls into one would ride a single cap unit for several signed
+    requests and break the plan's own cost model.
+
+    `/user/posts` therefore spends one unit for its handle resolve plus one per
+    searched keyword, and REPORTS that as `cap_units` — the caller is paying for
+    coverage and must be able to see the price."""
 
     def test_profile_spends_exactly_one_cap_unit(self, tmp_path, transport,
                                                  rapid_ledger):
@@ -870,19 +908,28 @@ class TestTheDailyCapIsChargedOncePerPage:
         assert third[1]['detail']
         assert rapid_ledger == []
 
-    def test_each_posts_page_spends_exactly_one_cap_unit(self, tmp_path,
-                                                          transport, rapid_ledger):
+    def test_a_posts_page_spends_one_unit_per_pooled_call_and_says_so(
+            self, tmp_path, transport, rapid_ledger):
+        # The chain is priced 2 + 1 + 1: page 1 pays for the handle resolve AND
+        # its one keyword, while a continuation resolves nothing and searches
+        # the handle alone. A cap of 4 is therefore spent exactly at page 3, and
+        # page 4 is the 429 — which pins the arithmetic from both ends.
         _pages(transport,
                authored_reply([('1', GENUINE)], cursor=10, has_more=True),
                authored_reply([('2', GENUINE)], cursor=20, has_more=True),
-               authored_reply([('3', GENUINE)], cursor=30, has_more=True))
-        app = _app(tmp_path, daily_request_cap_per_device=2)
+               authored_reply([('3', GENUINE)], cursor=30, has_more=True),
+               authored_reply([('4', GENUINE)], cursor=40, has_more=True))
+        app = _app(tmp_path, daily_request_cap_per_device=4)
         page = {'username': HANDLE, 'limit': 1}
-        results = _chain_posts(
-            app, page,
-            lambda body: {**page, 'page_token': body['page_token']},
-            lambda body: {**page, 'page_token': body['page_token']})
-        assert [status for status, _ in results] == [200, 200, 429]
+
+
+        def follow(body: dict) -> dict:
+            return {**page, 'page_token': body['page_token']}
+
+        results = _chain_posts(app, page, follow, follow, follow)
+        assert [status for status, _ in results] == [200, 200, 200, 429]
+        assert [body['cap_units'] for status, body in results
+                if status == 200] == [2, 1, 1]
         assert rapid_ledger == []
 
 

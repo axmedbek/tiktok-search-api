@@ -32,9 +32,16 @@ signer: local
 rapidapi_key:
 rapidapi_host: tiktok-api-signer.p.rapidapi.com
 search_host: https://search19-normal-alisg.tiktokv.com
+# Host for the user-scoped endpoints (/aweme/v1/aweme/post/ and
+# /tiktok/user/profile/other/v1). search_host serves ONLY the search paths and
+# 404s these; this is the host the real app calls them on (measured 2026-09-10).
+posts_host: https://api32-core-alisg.tiktokv.com
+# MUST match the app version of the identity below (its device_query
+# version_name). A mismatch is read by TikTok as hit_shark; the local signer
+# logs a WARNING naming both versions when they diverge.
 sign_app_version: 46.0.42
-sign_mssdk_ver_str: v05.01.02-alpha.7-ov-android
-sign_mssdk_ver_code: '83952160'
+sign_mssdk_ver_str: v05.03.01-ov-android
+sign_mssdk_ver_code: '84082976'
 sign_license_id: '2142840551'
 app_id: 1233
 device_type: sdk_gphone64_arm64

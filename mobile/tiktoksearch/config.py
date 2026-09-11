@@ -19,6 +19,24 @@ SIGNER_LOCAL = 'local'
 SIGNER_RAPID = 'rapid'
 SIGNER_LEGACY = 'legacy'
 SIGNER_MODES: frozenset[str] = frozenset((SIGNER_LOCAL, SIGNER_RAPID, SIGNER_LEGACY))
+# Which `dyn_encode` scheme the captured `(f24, f3)` pair belongs to — the value
+# that rides in the argus payload's f26.1. MEASURED for MSSDK v05.03.01 / app
+# 46.9.1 by the 2026-09-11 spike: the app's own f26 decodes to
+# `{1: 6, 2: h"438576747395d4cfe9eb4996"}`, and every scalar in this payload is
+# stored shifted, so f26.1 = 6 is dyn_version 3. The spike further reports that
+# the vendored `dyn_encode(dyn_version=3, ...)`, unmodified, reproduced that
+# 12-byte f26.2 exactly and was the only one of its eight branches to do so —
+# that second half is the spike's measurement, not one reproducible here, since
+# it needs the capture's own params/payload/rand.
+#
+# A config knob all the same: it is MSSDK-scoped, so the next MSSDK bump can
+# move it, and a live check must be able to correct it without a code change.
+# Inert with no pair configured.
+DEFAULT_DYN_VERSION = 3
+# The `(f24, f3)` pair is identity material of the same class as the cookie.
+# Named here because `__post_init__` and `from_mapping` both have to talk about
+# the two fields as one unit.
+DYN_PAIR_FIELDS: tuple[str, str] = ('dyn_seed', 'dyn_rand')
 
 @dataclass(frozen=True, slots=True)
 class ClientConfig:
@@ -58,10 +76,26 @@ class ClientConfig:
     # from_mapping coerces to '' and resolved_signer treats as unset.
     signer: str | None = ''
     search_host: str = 'https://search19-normal-alisg.tiktokv.com'
+    # Host for the USER-SCOPED endpoints (`/aweme/v1/aweme/post/` and
+    # `/tiktok/user/profile/other/v1`). `search_host` serves only the search
+    # paths and 404s these — measured 2026-09-10; this is the host the real app
+    # calls them on. `client._host_for` is the only reader.
+    posts_host: str = 'https://api32-core-alisg.tiktokv.com'
     # v46 signer params (must match the warm device's activated app version)
+    #
+    # `sign_app_version` is NOT enforced against the identity here — a frozen
+    # config has no identity to compare with, and the identities hot-reload
+    # under it. It is checked where the two meet and where a mismatch actually
+    # costs something: `signing.MetasecSigner.for_v46` compares it against the
+    # identity's own `device_query['version_name']` and logs a WARNING naming
+    # both versions. A mismatch is anti-block invariant (c) — TikTok reads it as
+    # hit_shark — so it must be visible, but it must not crash startup either:
+    # `pool._build_slots` builds an identity-free synthetic client when
+    # `identities.json` is missing, and raising would turn that into a boot
+    # failure.
     sign_app_version: str = '46.0.42'
-    sign_mssdk_ver_str: str = 'v05.01.02-alpha.7-ov-android'
-    sign_mssdk_ver_code: str = '83952160'
+    sign_mssdk_ver_str: str = 'v05.03.01-ov-android'
+    sign_mssdk_ver_code: str = '84082976'
     sign_license_id: str = '2142840551'
     # Warm identity (per-device): cookie/token from a logged-in app, plus the
     # full device query fingerprint (device_id/iid/cdid/openudid/region/...).
@@ -69,6 +103,29 @@ class ClientConfig:
     x_tt_token: str | None = None
     user_agent: str | None = None
     device_query: Mapping[str, Any] = field(default_factory=dict)
+    # The captured argus `(f24 dyn_seed, f3 rand)` PAIR — the one remaining
+    # capture dependency for the user-scoped endpoints. SECRET, in the same
+    # class as `cookie`: never logged, never returned, masked first6…last4 if a
+    # diagnostic must name it. `dyn_rand` is f3 and is also the `rand` the
+    # signer feeds to `dyn_encode`, so one value covers both and they cannot
+    # drift. Both or neither — see `__post_init__`.
+    dyn_seed: str | None = None
+    dyn_rand: int | None = None
+    dyn_version: int = DEFAULT_DYN_VERSION
+
+    def __post_init__(self) -> None:
+        """Reject a HALF pair, at the only boundary that can.
+
+        A `dyn_seed` with no `dyn_rand` is not a partially useful identity: a
+        good f24 beside a freely chosen f3 was MEASURED to be refused with a
+        zero-byte body, i.e. it fails exactly like no pair at all while looking
+        configured. Raising here makes a half-paired config impossible to hold
+        rather than merely discouraged, so no signer, pool or client has to
+        re-check it. The message names neither value."""
+        seed, rand = self.dyn_seed, self.dyn_rand
+        if bool(seed) != (rand is not None):
+            have, missing = DYN_PAIR_FIELDS if seed else DYN_PAIR_FIELDS[::-1]
+            raise ValueError(f'{have} is set without {missing}: the captured argus pair is one unit — configure both or neither')
 
     def resolved_signer(self) -> str:
         """The signer mode this config actually runs, as one of SIGNER_MODES.
@@ -107,6 +164,18 @@ class ClientConfig:
             if mode and mode not in SIGNER_MODES:
                 raise ValueError(f'unknown signer {mode!r}: expected one of {sorted(SIGNER_MODES)}, or empty to derive it from rapidapi_key')
             data['signer'] = mode
+        for name in ('dyn_rand', 'dyn_version'):
+            # YAML hands back a str for a quoted number, and these are shifted
+            # into a protobuf varint: coerced at the boundary (per
+            # .claude/rules/code-standards.md) so a quoted value cannot reach
+            # the signer as a string and fail inside the crypto. A bare
+            # `dyn_rand:` parses as None, which is a legitimate "unset" and is
+            # left for __post_init__ to pair-check; a bare `dyn_version:` falls
+            # back to the module default rather than becoming None.
+            if name in data and data[name] is not None:
+                data[name] = int(data[name])
+            elif name == 'dyn_version' and name in data:
+                del data[name]
         env_key = os.environ.get(RAPIDAPI_KEY_ENV, '').strip()
         if env_key:
             data['rapidapi_key'] = env_key

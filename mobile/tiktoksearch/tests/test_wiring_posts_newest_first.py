@@ -62,7 +62,9 @@ from conftest import (  # noqa: E402
     authored_reply,
     drive,
     identity,
+    profile_node,
     reply,
+    user_search_reply,
     write_config,
     write_identities,
 )
@@ -73,7 +75,11 @@ from tiktoksearch.api.app import (  # noqa: E402
     _create_time_key,
     _newest_first,
 )
-from tiktoksearch.client import SEARCH_ITEM_PATH, SEARCH_VIDEO_PATH  # noqa: E402
+from tiktoksearch.client import (  # noqa: E402
+    SEARCH_ITEM_PATH,
+    SEARCH_USER_PATH,
+    SEARCH_VIDEO_PATH,
+)
 from tiktoksearch.mapping import _iso_utc, flatten_video, to_int  # noqa: E402
 
 DEVICE_A = 'DEVA'
@@ -128,11 +134,26 @@ def _post(app, path: str, *payloads) -> list[tuple[int, dict]]:
     return drive(sequence())
 
 
+def _resolve_reply(nickname: str = HANDLE) -> dict:
+    """The user-search answer `/user/posts` resolves the handle against.
+
+    Its `nickname` IS the handle by default, so `_posts_keywords` derives the
+    handle keyword ALONE. Deliberate for this file: these tests are about the
+    ORDERING of one page, and a second (display-name) keyword would double the
+    signed requests while changing no record — the union dedups by id and the
+    script answers every keyword identically."""
+    return user_search_reply([profile_node(nickname=nickname)])
+
+
 def _by_path(transport: FakeTransport, mapping) -> None:
     """Answer each signed path from `mapping`. A keyword search drives BOTH
-    merged video endpoints, so a page normally needs an answer for each."""
+    merged video endpoints, so a page normally needs an answer for each — and
+    a `/user/posts` first page resolves the handle first, so the user-search
+    answer is supplied by default and may be overridden."""
+    answers = {SEARCH_USER_PATH: _resolve_reply(), **mapping}
+
     def handler(call):
-        answer = mapping[call['path']]
+        answer = answers[call['path']]
         return answer(call) if callable(answer) else json.loads(json.dumps(answer))
 
     transport.script(handler)

@@ -28,3 +28,21 @@ data_*/
 identities.json
 identities.json.tmp
 warm_device_query.json
+
+# Captured argus (f24 dyn_seed, f3 rand) pair — HALF A LIVE CREDENTIAL, in the
+# same class as the cookie above. Written by `tiktoksearch.argus_pair` and read
+# by `capture_identity_addon.py --set dyn_pair=`. The glob covers the documented
+# default name (mobile/dyn_pair.json) and any per-device variant beside it.
+dyn_pair*.json
+
+# Captured app requests — carry device fingerprints (masked, but still), never commit.
+# Scoped on purpose: a repo-wide `*.jsonl` also swallowed the committed capture
+# fixtures the unit tests read, which passes locally off an untracked file and
+# breaks on a fresh clone. The negation re-includes anything under a tests/ tree.
+captured_requests*.jsonl
+mobile/*.jsonl
+!**/tests/**/*.jsonl
+
+# Harvested post-feed spool — bulk feed data written by harvest_spool_addon.py
+harvest_spool/
+mobile/harvest_spool/

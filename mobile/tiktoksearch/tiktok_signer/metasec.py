@@ -6,7 +6,7 @@ from typing import Optional, Union
 from urllib.parse import urlparse
 
 from exception import InvalidEncryptionKey, InvalidURL
-from helpers.argus import generate_protobuf, encode_argus_fn
+from helpers.argus import generate_protobuf, encode_argus_fn, has_captured_pair
 from helpers.ladon import get_ladon_keys, encode_ladon
 from native import reverse_bits
 
@@ -42,7 +42,8 @@ class Metasec(object):
             dyn_seed: Optional[str] = None,
             dyn_version: Optional[int] = None,
             payload: Union[str, dict, bytes, None] = None,
-            cookies: Optional[str] = None
+            cookies: Optional[str] = None,
+            rand: Optional[int] = None
 
     ) -> dict:
         if not self._is_valid_url(url=url):
@@ -90,7 +91,8 @@ class Metasec(object):
             device_id=device_id,
             device_token=device_token,
             dyn_seed=dyn_seed,
-            dyn_version=dyn_version
+            dyn_version=dyn_version,
+            rand=rand
         )
 
         return {
@@ -116,6 +118,7 @@ class Metasec(object):
             device_token: Optional[str] = None,
             dyn_seed: Optional[str] = None,
             dyn_version: Optional[int] = None,
+            rand: Optional[int] = None,
 
     ) -> str:
         protobuf = generate_protobuf(
@@ -133,8 +136,12 @@ class Metasec(object):
             device_token=device_token,
             dyn_seed=dyn_seed,
             dyn_version=dyn_version,
+            rand=rand,
         )
-        argus = encode_argus_fn(protobuf=protobuf, sign_key=self._encryption_key)
+        # ONE test selects both halves of the corrected framing, so a corrected
+        # protobuf can never be wrapped in the legacy header/pad or vice versa.
+        argus = encode_argus_fn(protobuf=protobuf, sign_key=self._encryption_key,
+                                corrected=has_captured_pair(dyn_seed, rand))
         return argus
 
     @staticmethod

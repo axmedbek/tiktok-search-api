@@ -2,7 +2,15 @@ from __future__ import annotations
 from typing import Any, Optional
 from pydantic import BaseModel, Field, field_validator
 from ..filters import PublishTime, SearchKind, SortType
+from ..limits import MAX_POSTS_LIMIT, MAX_QUERY_CHARS, MAX_SEARCH_LIMIT, MAX_USERNAME_CHARS, USERNAME_PATTERN
 from ..paging import MAX_PAGE_TOKEN_CHARS
+
+# Those five bounds moved to `..limits` so a non-HTTP caller (the broker
+# worker) can reach one without importing the FastAPI application. They are
+# still readable AS `api.schemas.MAX_QUERY_CHARS` etc., which is what `app.py`
+# and the existing tests import. `MAX_SEARCH_LIMIT` is the new name for what
+# `SearchRequest.limit` spelled as a bare `le=300`; `MAX_POSTS_LIMIT` derives
+# from it there instead of restating the number.
 
 class FiltersIn(BaseModel):
     sort_type: Optional[SortType] = Field(default=None, description='Result ordering. `0` = relevance (default), `1` = most liked.')
@@ -11,8 +19,8 @@ class FiltersIn(BaseModel):
 
 class SearchRequest(BaseModel):
     type: SearchKind = Field(description='What to search: keyword, hashtag, or user.')
-    query: str = Field(min_length=1, max_length=200, description='The search term.')
-    limit: int = Field(default=30, ge=1, le=300, description='Max results per page (server-capped by `max_results_per_search`, 300 on the shipped profile). Cost scales with it: one page of results costs one signed request per ~10 raw items per endpoint, so a large `limit` buys depth in a single call at the price of latency. It spends one daily-cap unit either way, so `limit=300` in one call and `limit=30` chained are priced identically against the cap.')
+    query: str = Field(min_length=1, max_length=MAX_QUERY_CHARS, description='The search term.')
+    limit: int = Field(default=30, ge=1, le=MAX_SEARCH_LIMIT, description='Max results per page (server-capped by `max_results_per_search`, 300 on the shipped profile). Cost scales with it: one page of results costs one signed request per ~10 raw items per endpoint, so a large `limit` buys depth in a single call at the price of latency. It spends one daily-cap unit either way, so `limit=300` in one call and `limit=30` chained are priced identically against the cap.')
     cursor: int = Field(default=0, ge=0, description='Legacy pagination offset. Kept for compatibility, but a bare offset carries no TikTok search session and comes back empty (`empty_session`) — use `page_token` instead. Start at 0.')
     page_token: Optional[str] = Field(default=None, max_length=MAX_PAGE_TOKEN_CHARS, description="Opaque continuation token from a prior response's `page_token`. It carries TikTok's own cursor plus the `search_id` search session, so the next page actually returns fresh results. It is authenticated with a per-process secret and is only valid for the same type/query/filters on the server instance that minted it: tokens do NOT survive a server restart (a TikTok search session is short-lived anyway), and a tampered or stale one is rejected with 422. It pins the device that served the previous page, so the server default `fan_out` is coerced to 1 — an explicit `fan_out` above 1 alongside a token is rejected with 422. Mutually exclusive with a non-zero `cursor`.")
     fan_out: Optional[int] = Field(default=None, ge=1, le=32, description='Query this many devices in parallel and merge+dedupe their results. Higher = more unique results per call (each device returns a shallow window), at the cost of one daily-cap unit per device. Capped at the pool size. Defaults to the server `default_fan_out` (so a plain request already returns a merged page). Ignored (forced to 1) when `page_token` is supplied, because a search session lives on a single device.')
@@ -50,13 +58,10 @@ class HealthResponse(BaseModel):
     devices: list[DeviceStatus]
 
 # --- user profile + user posts -------------------------------------------
-# Both endpoints are entered by HANDLE, and that handle reaches a SIGNED TikTok
-# URL as the search keyword — so it is bounded and charset-checked HERE, at the
-# boundary (.claude/rules/security.md), never downstream. TikTok handles are
-# letters, digits, '.' and '_', up to 24 characters; anything else is a client
-# error, not something to forward upstream and hope.
-MAX_USERNAME_CHARS = 24
-USERNAME_PATTERN = r'^[A-Za-z0-9._]+$'
+# Both endpoints are entered by HANDLE, bounded and charset-checked HERE, at
+# the boundary (.claude/rules/security.md), never downstream — with
+# `MAX_USERNAME_CHARS` / `USERNAME_PATTERN` imported from `..limits`, because
+# the broker worker enters the same two endpoints and must apply the same rule.
 # `user_id` is a numeric string upstream and `sec_uid` a base64url-ish blob.
 # Neither is used to build a request on this interim path — they are echoed
 # into the posts response — but both are bounded anyway: an unbounded string a
@@ -67,9 +72,6 @@ MAX_USER_ID_CHARS = 32
 USER_ID_PATTERN = r'^[0-9]+$'
 MAX_SEC_UID_CHARS = 200
 SEC_UID_PATTERN = r'^[A-Za-z0-9_-]+$'
-# Same ceiling as `SearchRequest.limit`: `/user/posts` is SERVED BY that search
-# path, so it cannot meaningfully ask for more than a search page may return.
-MAX_POSTS_LIMIT = 300
 # Where each payload came from, as a machine-readable field rather than a
 # footnote in a docstring. `user_search` is the user-search node the profile is
 # flattened from; `search` is the keyword-search reply the posts are filtered
@@ -80,6 +82,23 @@ POSTS_SOURCE = 'search'
 # `/user/posts` never returns an account's full post history on this path — see
 # `UserPostsResponse.complete`.
 POSTS_COMPLETE = False
+# `/user/posts` answers "what did this account post RECENTLY", and that is the
+# whole point of the endpoint: it is not "everything this account ever posted".
+# 30 days is the default because that is where the measured yield is. On
+# `@bakuesaz` (5236 posts) the unfiltered relevance search returned 18 posts
+# spread over 17 MONTHS — the same order of magnitude of records as one 30-day
+# window (17), except almost none of them recent. Narrowing the window does not
+# cost records here; it changes which records they are.
+DEFAULT_POSTS_PERIOD = PublishTime.LAST_MONTH
+# `PublishTime.ALL_TIME` ('0') is not a recency window, it is the ABSENCE of
+# one — i.e. exactly the unfiltered behaviour this endpoint moved away from.
+# Rejected at the boundary rather than quietly honoured, so a caller asking for
+# "everything ever" is told this endpoint does not serve it (`/search` on the
+# handle does, unfiltered, with the 17-month spread that implies).
+POSTS_PERIOD_ALL_TIME_MSG = (
+    'period must be a recency window — 1, 7, 30, 90 or 180 days. 0 (all time) is not one: '
+    '/user/posts returns RECENT posts. Use /search for an unfiltered search on the handle.'
+)
 
 
 class _HandleRequest(BaseModel):
@@ -134,9 +153,19 @@ class ProfileResponse(BaseModel):
 class UserPostsRequest(_HandleRequest):
     user_id: Optional[str] = Field(default=None, min_length=1, max_length=MAX_USER_ID_CHARS, pattern=USER_ID_PATTERN, description='Optional. The `user_id` a prior `/profile` call returned. It is not needed to fetch anything — this path searches on the handle — but supplying it pins the ids in the response even on a page whose records were all filtered out.')
     sec_uid: Optional[str] = Field(default=None, min_length=1, max_length=MAX_SEC_UID_CHARS, pattern=SEC_UID_PATTERN, description='Optional, and exactly like `user_id`: echoed back, never used to fetch.')
-    limit: int = Field(default=30, ge=1, le=MAX_POSTS_LIMIT, description='Max results to ASK SEARCH for (server-capped by `max_results_per_search`). Records by other authors are then dropped, so `count` is normally well below this — see `count`.')
-    page_token: Optional[str] = Field(default=None, max_length=MAX_PAGE_TOKEN_CHARS, description="Opaque continuation token from a prior response's `page_token`. Bound to this endpoint and this handle: a `/search` token is rejected here with 422, and so is this one at `/search`. It pins the device that served the previous page, and like every page_token it does not survive a server restart.")
-    model_config = {'json_schema_extra': {'examples': [{'username': '@bakuesaz', 'limit': 60}]}}
+    limit: int = Field(default=30, ge=1, le=MAX_POSTS_LIMIT, description='Max results to ASK SEARCH for, PER KEYWORD (server-capped by `max_results_per_search`), and also the ceiling on `count`: records by other authors are dropped and the surviving records from every keyword are unioned, then trimmed back to this many, OLDEST first out — so `count` never exceeds it and what a trim discards is the least recent. `count` is normally well below it anyway — see `count`.')
+    period: PublishTime = Field(default=DEFAULT_POSTS_PERIOD, description='Recency window to search, in days: `1`, `7`, `30` (default), `90` or `180`. THIS IS THE POINT OF THE ENDPOINT — it answers "what did this account post recently", not "everything this account ever posted". It is the same `publish_time` filter `/search` accepts, so `0` (all time) is REJECTED with 422 here: an unfiltered relevance search on a handle spreads a handful of posts across many months (measured: 18 posts over 17 months for a 5236-post account), which is what this window exists to avoid. A narrower window is not cheaper and a wider one is not more complete — cost is fixed per keyword (see `cap_units`) and the window usually exhausts inside a single request.')
+    page_token: Optional[str] = Field(default=None, max_length=MAX_PAGE_TOKEN_CHARS, description="Opaque continuation token from a prior response's `page_token`. Bound to this endpoint, this handle AND this `period`: a `/search` token is rejected here with 422, so is this one at `/search`, and so is one minted under a different `period`. A continuation searches the HANDLE ALONE (no display-name keyword, no resolve), because that is the single query the token was minted for — so it also costs one cap unit instead of the first page's several. It pins the device that served the previous page, and like every page_token it does not survive a server restart.")
+    model_config = {'json_schema_extra': {'examples': [{'username': '@bakuesaz', 'limit': 60}, {'username': '@bakuesaz', 'period': '7'}]}}
+
+    @field_validator('period')
+    @classmethod
+    def _reject_all_time(cls, value: PublishTime) -> PublishTime:
+        # AFTER coercion (not `mode='before'`), so the check runs on an enum
+        # member and cannot be fooled by `0` vs `'0'`.
+        if value is PublishTime.ALL_TIME:
+            raise ValueError(POSTS_PERIOD_ALL_TIME_MSG)
+        return value
 
 
 class UserPostsResponse(BaseModel):
@@ -148,10 +177,13 @@ class UserPostsResponse(BaseModel):
     # type it optional-and-possibly-missing — exactly the doc-footnote status
     # these two fields exist to avoid. The handler passes both explicitly.
     source: str = Field(description="Where these posts came from, machine-readably. `search` means they are the videos KEYWORD SEARCH surfaces for this handle, filtered down to the ones this account authored — not a read of the account's post feed. Treat any other value as a different (better) source.")
-    complete: bool = Field(description="Whether this is the account's full post history. **Always false on the `search` source:** the set is whatever keyword search surfaces for the handle, so posts the account really has may never appear — in practice a small fraction of a large account's catalogue. Yield tracks how visible the account is in search, and a low-visibility account can legitimately return few results or none. This is about COMPLETENESS only: `results` is ordered newest-first within each page (see `results`), so a short page is still a correctly ordered page.")
-    device: str = Field(description='Label of the device that served the request.')
-    count: int = Field(description='How many records `results` carries — i.e. AFTER dropping the search hits by other authors. It is normally well below `limit`, and can be 0 while `has_more` is true: the filter runs after the page is fetched, so an unlucky page can be entirely other people. Keep paging. **This endpoint does not verify that the handle exists**, so a nonexistent handle also answers `200` with `count: 0` here while `/profile` answers `404` — the two are indistinguishable on this path, since a real but low-visibility account search simply may not surface; a caller that needs an existence answer asks `/profile`.')
-    has_more: bool = Field(description='Whether the underlying search has more pages. Judged on the unfiltered page, so it stays true even when `count` is 0.')
-    page_token: Optional[str] = Field(default=None, description='Pass this back as `page_token` for the next page. Null when there is nothing more to fetch.')
+    complete: bool = Field(description="Whether this is the account's full post history. **Always false on the `search` source**, now for three independent reasons: the set is only what keyword search SURFACES (posts the account really has may never appear); it is bounded to `period`, so older posts are excluded BY DESIGN; and TikTok's index is not deterministic — the same keyword in the same window measured 17 records on one call and 14 on another. Coverage, not completeness, is what the multi-keyword union buys (see `keywords`). Yield tracks how visible the account is in search, so a low-visibility account can legitimately return few results or none. COMPLETENESS only: `results` is ordered newest-first (see `results`), so a short page is still a correctly ordered one.")
+    period: PublishTime = Field(description='The recency window that was searched, echoed back. Every record in `results` is from within it, so a caller can state the range it is looking at without inferring it from the records.')
+    keywords: list[str] = Field(description="The keywords that were actually searched, in the order they were spent, so a caller can see WHY it got what it got. Always starts with the handle; the account's `display_name` follows when it adds something (it is omitted when absent, or equal to the handle case-insensitively). Each entry is one search, one `cap_units` unit, and its own `source_term` on the records it surfaced. Measured live on `@bakuesaz` in the default window: `bakuesaz` alone surfaced 14 of the returned posts and `BAKU ES` (its display name) another 10, for 24 across 16 distinct days — the second keyword is a real coverage gain, not a spelling variant. Nothing here is guessed from how the handle might split into words.")
+    cap_units: int = Field(description='What this request COST against the per-device daily cap. The cap is charged per pooled call, not per signed request, so this is one unit per entry in `keywords` plus one for the display-name resolve — i.e. `len(keywords) + 1` on a first page, and exactly `1` on a `page_token` continuation, which skips the resolve and searches the handle alone. Stated rather than hidden: the caller is paying for coverage and must be able to see the price. Each of those calls may itself spend several signed requests across the two merged video endpoints — that is the pre-existing `/search` cost model and is NOT charged again against the cap.')
+    device: str = Field(description='Label(s) of the device(s) that served this request, `+`-joined and de-duplicated: one pooled call per keyword plus the resolve, each independently scheduled, so on a multi-device pool they need not be the same device.')
+    count: int = Field(description='How many records `results` carries — i.e. AFTER dropping the search hits by other authors and unioning the keywords. Capped by `limit`, normally well below it, and can be 0 while `has_more` is true: the filter runs after the pages are fetched, so an unlucky page can be entirely other people. A nonexistent handle answers `404` here (the display-name resolve looks it up), so `count: 0` now means "this account surfaced nothing in this window" — try a wider `period` before concluding anything.')
+    has_more: bool = Field(description='Whether any of the searched keywords has more pages. Judged on the unfiltered pages, so it stays true even when `count` is 0. Usually FALSE even on a large account: a `period` window typically exhausts within one request, which is why deeper paging is not where coverage comes from here — extra keywords are.')
+    page_token: Optional[str] = Field(default=None, description='Pass this back as `page_token` for the next page. Null when there is nothing more to fetch **and also whenever more than one keyword was searched**: a page merged from several queries has no single search session to resume, so no token is minted rather than one that would resume a different query than it was minted for. A single-keyword page (no usable display name) still gets one.')
     elapsed_s: float
-    results: list[dict[str, Any]] = Field(description="Video records in the IDENTICAL shape `/search` returns (`flatten_video`), so a client renders them with the same code. **Ordered newest first by `create_time`** — records whose `create_time` is null (unknown upstream) come LAST, since an undated post cannot be truthfully placed among dated ones. The order is stable, so identical requests return identical orderings. **This orders the PAGE, not the paginated STREAM:** pages still arrive in search-relevance order, so page 2 can contain videos both older AND newer than page 1. Read one page and you get a correctly ordered page; paginate and you must ACCUMULATE and RE-SORT across pages yourself.")
+    results: list[dict[str, Any]] = Field(description="Video records in the IDENTICAL shape `/search` returns (`flatten_video`), so a client renders them with the same code. De-duplicated by record `id` across the searched keywords, and each record's `source_term` names the keyword that surfaced it. **Ordered newest first by `create_time`** — records whose `create_time` is null (unknown upstream) come LAST, since an undated post cannot be truthfully placed among dated ones. The order is stable, so identical requests return identical orderings. **This orders the PAGE, not the paginated STREAM:** pages still arrive in search-relevance order, so page 2 can contain videos both older AND newer than page 1. Read one page and you get a correctly ordered page; paginate and you must ACCUMULATE and RE-SORT across pages yourself.")

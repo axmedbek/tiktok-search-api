@@ -126,7 +126,7 @@ def _paginate(client: TikTokClient, *, limit: int, start_cursor: int,
     out: list[dict] = []
     end = client._paginate_posts(
         out=out, seen=seen if seen is not None else SeenWindow(),
-        user_id=UID, sec_uid=SEC, limit=limit, start_cursor=start_cursor)
+        user_id=UID, limit=limit, start_cursor=start_cursor)
     _assert_resumable_only_if_advanced(end, start_cursor)
     # Property 3, pinned at the INNER seam as well as at the published state:
     # every scripted reply carries `log_pb.impr_id`, so a search_id read here
@@ -278,7 +278,10 @@ class TestBackwardsCursorBoundaries:
         sent = transport.calls[0]['params']
         assert sent['max_cursor'] == str(MS)
         assert sent['user_id'] == UID
-        assert sent['sec_user_id'] == SEC
+        # NO sec_user_id: the app's own working request omits it and an
+        # unvalidated one was measured to get the request refused with a
+        # zero-byte body (2026-09-11, Arm M).
+        assert 'sec_user_id' not in sent
         assert sent['count'] == str(POSTS_PAGE_COUNT)
         assert transport.calls[0]['path'] == USER_POSTS_PATH
 

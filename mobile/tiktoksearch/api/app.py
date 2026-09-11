@@ -5,7 +5,7 @@ import os
 import time
 from contextlib import asynccontextmanager, contextmanager
 from functools import partial
-from typing import Iterator
+from typing import Callable, Iterator
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from ..client import SEARCH_ITEM_PATH, SEARCH_PATHS, SEARCH_VIDEO_PATH, TikTokClient
@@ -15,7 +15,7 @@ from ..filters import SearchFilters, SearchKind, SearchPage, SearchQuery
 from ..identity_manager import IdentityStore
 from ..paging import TOKEN_VERSION, PageToken, decode, encode, query_hash
 from ..pool import CallOutcome, ClientPool, HealthVerdict, posts_verdict
-from .schemas import POSTS_COMPLETE, POSTS_SOURCE, PROFILE_SOURCE, HealthResponse, ProfileRequest, ProfileResponse, SearchRequest, SearchResponse, UserPostsRequest, UserPostsResponse
+from .schemas import MAX_QUERY_CHARS, POSTS_COMPLETE, POSTS_SOURCE, PROFILE_SOURCE, HealthResponse, ProfileRequest, ProfileResponse, SearchRequest, SearchResponse, UserPostsRequest, UserPostsResponse
 logger = logging.getLogger('tiktoksearch.api')
 DEFAULT_CONFIG_PATH = 'config_signed.yaml'
 # Optional hot-reloadable warm-identity file. Env override wins; else config's
@@ -95,6 +95,21 @@ POSTS_QUERY_KIND = 'user_posts'
 # nothing about the identity, the device or the upstream reply.
 NO_SUCH_USER_DETAIL = 'No TikTok user matches that username.'
 UNMINTABLE_TOKEN_DETAIL = 'TikTok returned a page that cannot be continued — retry the request.'
+# One keyword of a `/user/posts` request came back empty-shaped. LOGGED rather
+# than raised — but only while another keyword may still serve records; if every
+# keyword answers this way the request re-raises and 502s (anti-block invariant
+# (a)). On a sessionless first page `client._get_signed` cannot tell
+# `federation_empty` — TikTok's own "the federated search matched nothing",
+# which a narrow `period` window on a niche keyword genuinely produces — from
+# risk-control, and `.claude/rules/lessons/anti-block.md` is explicit that
+# identity health is judged by whether OTHER queries on the same device succeed
+# and that a lone `federation_empty` is never evidence of hit_shark. Invariant
+# (b) is untouched either way: `pool.run_call` already reported the empty
+# against the identity before this line runs.
+# Args: the keyword's 1-based position, the keyword count, the keyword, the
+# error. The keyword is safe to log — it is a handle or a public display name,
+# both of which the response itself returns in `keywords`.
+KEYWORD_EMPTY_MSG = 'posts keyword %d/%d (%s) came back empty; other keywords may still serve records: %s'
 
 
 def _query_hash(kind: str, term: str, filters: SearchFilters) -> str:
@@ -160,9 +175,19 @@ def _mint_token(query_hash_value: str, handle: str, page: SearchPage, *, kind: s
         raise HTTPException(status_code=502, detail=UNMINTABLE_TOKEN_DETAIL) from exc
 
 
-def _posts_query_hash(username: str) -> str:
+def _posts_query_hash(username: str, filters: SearchFilters) -> str:
     """The query identity a `/user/posts` token is bound to: this handle, under
-    POSTS_QUERY_KIND, with no filters (the endpoint accepts none).
+    POSTS_QUERY_KIND, in this recency window.
+
+    `filters` is IN the hash — it is the whole reason this is not
+    `query_hash(kind, term, {})` any more. The endpoint's `period` becomes a
+    `publish_time` filter, so two requests for the same handle under different
+    windows are different queries served by different upstream sessions. A hash
+    that ignored them would let a token minted at `period=30` decode against a
+    `period=90` request and resume the 30-day session while the response claimed
+    the 90-day window — a token that decodes to a different query than it was
+    minted for, which is the one thing a token must never do. Mint and decode
+    both come through here, so they cannot disagree.
 
     Lower-cased, because TikTok handles are case-insensitive and the boundary
     normalisation (`_HandleRequest`) strips `@` and whitespace but NOT case.
@@ -176,38 +201,90 @@ def _posts_query_hash(username: str) -> str:
     construction. The handle is lower-cased for the HASH only: `query.term`
     (what reaches the signed URL) and the echoed `username` stay in the
     caller's normalised spelling."""
-    return query_hash(POSTS_QUERY_KIND, username.lower(), {})
+    return query_hash(POSTS_QUERY_KIND, username.lower(), filters.to_query_params())
 
 
-def _to_posts_query(req: UserPostsRequest, max_results: int) -> SearchQuery:
-    """The keyword search that serves `/user/posts`: the handle as the term.
+def _decode_posts_token(req: UserPostsRequest, filters: SearchFilters) -> PageToken | None:
+    """`req.page_token` decoded, or None when the request carries none.
 
-    `req.username` is already normalised and charset-bounded by
-    `_HandleRequest`, so what reaches the signed URL is what the boundary
-    admitted."""
-    token: PageToken | None = None
-    if req.page_token:
-        # Same contract as `/search`: a malformed / unauthenticated /
-        # wrong-version / foreign token is a CLIENT error (422), never a 502.
-        # A `/search` token fails HERE, on the query hash, because of
-        # POSTS_QUERY_KIND.
-        try:
-            token = decode(req.page_token, expected_query_hash=_posts_query_hash(req.username), allowed_paths=POSTS_TOKEN_PATHS)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    Split from `_to_posts_query` because the token is decoded ONCE per request
+    while a query is now built once per searched keyword — and because the
+    decoded token is what decides whether this request resolves and derives
+    keywords at all (see the handler).
+
+    Same contract as `/search`: a malformed / unauthenticated / wrong-version /
+    foreign token is a CLIENT error (422), never a 502. A `/search` token fails
+    HERE, on the query hash, because of POSTS_QUERY_KIND; a posts token minted
+    under a different `period` fails here too, because the window is in that
+    hash."""
+    if not req.page_token:
+        return None
     try:
-        return SearchQuery(kind=SearchKind.KEYWORD, term=req.username, limit=min(req.limit, max_results), filters=SearchFilters(), page_token=token)
+        return decode(req.page_token, expected_query_hash=_posts_query_hash(req.username, filters), allowed_paths=POSTS_TOKEN_PATHS)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-def _mint_posts_token(query: SearchQuery, handle: str, page: SearchPage) -> str | None:
-    """The continuation token for a posts page, or None when there is no more.
+def _to_posts_query(*, keyword: str, filters: SearchFilters, token: PageToken | None, limit: int) -> SearchQuery:
+    """One of the keyword searches that serve `/user/posts`.
 
-    Binds the page to THIS handle under POSTS_QUERY_KIND; the out-of-bounds
-    `ValueError` net that used to sit here now lives in `_mint_token`, shared
-    with `/search`."""
-    return _mint_token(_posts_query_hash(query.term), handle, page, kind=POSTS_QUERY_KIND)
+    `keyword` rather than the request's handle because a first page searches
+    the handle AND the account's display name — see `_posts_keywords`. `limit`
+    is already server-capped by the caller (the handler caps it once, so the
+    per-keyword pages and the union they feed are bounded by the same number),
+    and `filters` carries the `period` window that makes this endpoint about
+    RECENT posts.
+
+    Every keyword reaches a signed URL, so every keyword is bounded before it
+    gets here: the handle by `_HandleRequest`, a derived one by
+    `_posts_keywords`.
+
+    `token` is attached to the query that resumes its session, and the handler
+    only ever has one such query — a continuation searches the handle alone."""
+    try:
+        return SearchQuery(kind=SearchKind.KEYWORD, term=keyword, limit=limit, filters=filters, page_token=token)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _posts_call(query: SearchQuery) -> Callable[[TikTokClient], CallOutcome[SearchPage]]:
+    """The pooled call for ONE `/user/posts` keyword search.
+
+    A factory rather than a closure written inside the handler's keyword loop:
+    a loop-body closure captures the loop VARIABLE, and with several queries
+    per request that is a live hazard here, not a style preference.
+
+    The verdict is `posts_verdict` and NEVER `pool._search_verdict`. Search's
+    rule charges an empty FIRST page as EMPTY identity evidence, and this
+    endpoint now issues several first pages per request — so one caller request
+    could reach `DEFAULT_STALE_AFTER` on its own and retire a warm identity
+    that did nothing wrong. `posts_verdict` returns NEUTRAL for a legitimately
+    empty page (reported neither ok nor empty) and OK when records came back.
+    Genuine risk-control still reaches identity health regardless of the
+    verdict: `pool.run_call` reports every escaping `SoftError` as an empty."""
+
+    def call(client: TikTokClient) -> CallOutcome[SearchPage]:
+        page = client.search(query)
+        return CallOutcome(result=page, verdict=posts_verdict(page))
+
+    return call
+
+
+def _mint_posts_token(username: str, filters: SearchFilters, handle: str, page: SearchPage) -> str | None:
+    """The continuation token for a SINGLE-KEYWORD posts page, or None when
+    there is no more.
+
+    Binds the page to THIS handle in THIS window under POSTS_QUERY_KIND; the
+    out-of-bounds `ValueError` net that used to sit here now lives in
+    `_mint_token`, shared with `/search`.
+
+    It takes `username` and not the query's term because the two must AGREE: a
+    token may only be minted for the query `_posts_query_hash` describes, i.e.
+    the handle search. The handler is what enforces that, by calling this only
+    when the handle was the one and only keyword searched — a page unioned from
+    several queries has no single session to resume, so it gets no token at all
+    (`run_merged` refuses one for a merged fan-out page for the same reason)."""
+    return _mint_token(_posts_query_hash(username, filters), handle, page, kind=POSTS_QUERY_KIND)
 
 
 def _record_handle(record: dict) -> str | None:
@@ -235,6 +312,78 @@ def _authored_by(records: list[dict], username: str) -> list[dict]:
     record whose author carries no handle is DROPPED, never matched."""
     wanted = username.lower()
     return [record for record in records if _record_handle(record) == wanted]
+
+
+def _posts_keywords(username: str, display_name: str | None) -> list[str]:
+    """The keywords ONE `/user/posts` first page searches, in spend order.
+
+    Coverage on this endpoint comes from keywords, not from pages: a `period`
+    window exhausts inside a single request (`has_more=False` on page 1), so
+    there is nothing deeper to page into. Measured on `@bakuesaz` in the 30-day
+    window: the handle alone found 14 posts across 13 distinct days; unioning
+    the display name took the live answer to 24 across 16, spanning 2026-08-11
+    to 2026-09-08.
+
+    Both sources are things this service ALREADY KNOWS:
+
+    * the normalised handle — what the caller asked for;
+    * the account's `display_name`, straight off the node the resolve matched
+      (`client._match_user_node`'s `nickname`), so it costs nothing beyond the
+      resolve that is already paid for.
+
+    It is deliberately NOT a handle-splitting heuristic. `baku`/`es`/`az` out of
+    `bakuesaz` is a guess about how a handle decomposes, and a guess that
+    happens to work for one account is not a derivation — it would spend a cap
+    unit per invented fragment on every other account, and each fragment is a
+    broad query whose hits are mostly other authors. `baku es` is in here
+    because it IS the account's own display name (`BAKU ES`), a value TikTok
+    gave us, not because the handle looks like it splits that way.
+
+    The display name is SKIPPED when it adds nothing — empty, or equal to the
+    handle case-insensitively — because an extra keyword is an extra cap unit
+    and re-searching the same string twice buys no records."""
+    keywords = [username]
+    extra = (display_name or '').strip()
+    if not extra or extra.lower() == username.lower():
+        return keywords
+    if len(extra) > MAX_QUERY_CHARS:
+        # SKIPPED, never truncated: a truncated nickname is a different query,
+        # and spending a cap unit on a query nobody chose is worse than
+        # searching one keyword fewer. The bound is `SearchRequest.query`'s —
+        # the same ceiling the search path already accepts — and it matters
+        # because `display_name` is UPSTREAM-controlled and ends up in a signed
+        # URL. (`urlencode` in `client._get_signed` handles the escaping; this
+        # is about length only.)
+        logger.info('display-name keyword skipped: %d chars exceeds the %d-char search bound', len(extra), MAX_QUERY_CHARS)
+        return keywords
+    keywords.append(extra)
+    return keywords
+
+
+def _union_authored_by(pages: list[SearchPage], username: str) -> list[dict]:
+    """Every record across `pages` that this handle authored, de-duplicated.
+
+    The author filter is `_authored_by` — THE one, on the identity field —
+    applied per page rather than reimplemented over the union: a page carrying
+    another account's video is the same failure whichever keyword surfaced it.
+
+    Dedup is by record `id`, on `pool.run_merged`'s rule, including its choice
+    to DROP an id-less record rather than keep it un-deduped. `flatten_video`
+    returns None without an `aweme_id`, so an id-less record cannot occur here;
+    if one ever did, admitting it would be admitting exactly the duplicate this
+    exists to stop. The keywords OVERLAP by design — the display-name search
+    re-finds much of what the handle search found — so this is the normal path,
+    not a defensive one."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for page in pages:
+        for record in _authored_by(page.records, username):
+            key = record.get('id')
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(record)
+    return out
 
 
 # A record whose `create_time` is unknown sorts under this key. It is the empty
@@ -474,53 +623,138 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
 
     @app.post('/user/posts', response_model=UserPostsResponse, tags=['user'])
     async def user_posts(req: UserPostsRequest, pool: ClientPool=Depends(get_pool)) -> UserPostsResponse:
-        """The videos search surfaces for one handle, filtered to that author.
+        """The RECENT videos search surfaces for one handle, filtered to that
+        author.
 
-        NOT a timeline and NOT the account's full history — `source` and
-        `complete` say so in the response, and `UserPostsResponse` explains
-        both.
+        RECENCY IS THE CONTRACT. `period` (default 30 days) is applied as the
+        `publish_time` filter `SearchFilters` already emits, because an
+        unfiltered relevance search on a handle answers a different question:
+        measured on `@bakuesaz` (5236 posts), unfiltered returned 18 posts
+        spread over 17 MONTHS, while one 30-day window returned 17 — the same
+        order of magnitude of records, all of them actually recent. Still NOT a
+        timeline and NOT the full history: `source`, `complete` and `period` say
+        so in the response, and `UserPostsResponse` explains each.
 
-        ONE `run_call` per page, therefore ONE daily-cap unit per page: the cap
-        is charged per run_call, not per signed request. Inside it, this pays
-        exactly what `/search` pays for the same `limit` — it IS `client.search`
-        — so a page may spend several signed requests on the two merged video
-        endpoints. That is the pre-existing search cost model, unchanged;
-        what must not happen is stacking a SECOND logical call (a resolve, say)
-        into this one, which would ride the same cap unit for free.
+        COVERAGE COMES FROM KEYWORDS, NOT PAGES. The window exhausts inside a
+        single request (`has_more=False` on page 1), so there is nothing deeper
+        to page into; searching the handle AND the account's display name and
+        unioning the author-filtered results took the live yield from 14 records
+        over 13 distinct days to 24 over 16. Both keywords are values this
+        service already holds — see `_posts_keywords`, which also says why no
+        keyword is ever guessed out of the handle's spelling.
+
+        COST, exactly as the response's `cap_units` states it: the daily cap is
+        charged per `run_call`, so this spends ONE UNIT PER KEYWORD plus one for
+        the resolve, and a continuation — which skips the resolve and searches
+        the handle alone — spends exactly one. The searches are deliberately
+        NOT stacked into a single `fn` to make that number look smaller: several
+        logical calls riding one cap unit is precisely the cost-model break
+        `/profile`'s docstring warns about, and the caller is paying for
+        coverage and must be able to see the price. Inside each unit the
+        signed-request count is `/search`'s pre-existing one, unchanged.
 
         No fan-out, ever: a merged multi-device page cannot be resumed (it has
         no single search session to pin) and it would spend one cap unit per
         device on a page this endpoint then filters down anyway."""
-        query = _to_posts_query(req, config.max_results_per_search)
         started = time.monotonic()
         loop = asyncio.get_running_loop()
-        # A search session lives on ONE device, so a continuation is pinned to
-        # the device that served the previous page — exactly as in `/search`.
-        handle = query.page_token.device_handle if query.page_token is not None else None
-
-        def call(client: TikTokClient) -> CallOutcome[SearchPage]:
-            page = client.search(query)
-            return CallOutcome(result=page, verdict=posts_verdict(page))
-
+        # `filters.py` is THE mechanism for this — the same `SearchFilters`
+        # `/search` ships, emitting the same flat v46 `publish_time` param. No
+        # parallel recency path.
+        filters = SearchFilters(publish_time=req.period)
+        token = _decode_posts_token(req, filters)
+        # Capped ONCE, here, so the per-keyword queries and the union they feed
+        # are bounded by the same number.
+        limit = min(req.limit, config.max_results_per_search)
+        # A continuation resumes ONE search session, so it searches exactly the
+        # keyword that session was minted for — the handle — and does NOT
+        # resolve. That is also what makes a token unable to mis-decode: the
+        # derivation that could add a second keyword never runs on this branch,
+        # so the query sent is provably the query the token's hash names.
+        keywords = [req.username]
+        devices: list[str] = []
+        pages: list[SearchPage] = []
+        empties: list[SoftError] = []
+        # Cap accounting, reported to the caller: one unit per `pool.run_call`,
+        # counted BEFORE the call because `acquire` reserves the unit before
+        # `fn` runs — a call that then raises `SoftError` has still spent it.
+        cap_units = 0
+        token_page: SearchPage | None = None
+        token_handle: str | None = None
         with _domain_errors():
-            served, page = await loop.run_in_executor(None, partial(pool.run_call, call, handle=handle))
-        # Filter, then order newest-first — one canonical ordering that
-        # everything downstream (`_posts_ids`, `results`) reads. The sort is a
-        # PERMUTATION of `_authored_by`'s output, so `_posts_ids`' guarantee is
-        # untouched: every record it can read ids off still matched the handle
-        # on the identity field.
-        records = _newest_first(_authored_by(page.records, req.username))
+            if token is None:
+
+                def resolve(client: TikTokClient) -> CallOutcome[dict]:
+                    # `/profile`'s call, for `/profile`'s reasons: ONE signed
+                    # request, and a returned record means the handle matched a
+                    # real account EXACTLY, so the identity is trusted. This is
+                    # also where a nonexistent handle now raises `NotFound` →
+                    # 404, which `/user/posts` did not do before (it answered
+                    # 200 with count 0); documented on `UserPostsResponse.count`.
+                    return CallOutcome(result=client.profile_from_search(req.username), verdict=HealthVerdict.OK)
+
+                cap_units += 1
+                served, profile_record = await loop.run_in_executor(None, partial(pool.run_call, resolve))
+                devices.append(served.label)
+                keywords = _posts_keywords(req.username, profile_record.get('display_name'))
+            # A token pins the device that owns the session, exactly as in
+            # `/search`; a first page takes whatever the pool hands each call.
+            handle = token.device_handle if token is not None else None
+            single = len(keywords) == 1
+            for position, keyword in enumerate(keywords, start=1):
+                query = _to_posts_query(keyword=keyword, filters=filters, token=token, limit=limit)
+                cap_units += 1
+                try:
+                    served, page = await loop.run_in_executor(None, partial(pool.run_call, _posts_call(query), handle=handle))
+                except SoftError as exc:
+                    # Not this request's verdict while another keyword may
+                    # still serve records — see KEYWORD_EMPTY_MSG for why, and
+                    # for why identity health is unaffected by tolerating it.
+                    empties.append(exc)
+                    logger.warning(KEYWORD_EMPTY_MSG, position, len(keywords), keyword, exc)
+                    continue
+                devices.append(served.label)
+                pages.append(page)
+                if single:
+                    # The ONLY page a token may be minted from: one keyword
+                    # searched, and it was the handle, which is what
+                    # `_posts_query_hash` describes.
+                    token_page, token_handle = page, served.handle
+            if not pages:
+                # EVERY keyword came back shadow-block-shaped, so that IS the
+                # request's answer: re-raise the first, which `_domain_errors`
+                # maps to 502 — anti-block invariant (a), never a silent 200
+                # with no records for a shadow-block. `keywords` is never
+                # empty, so an empty `pages` means every call raised and
+                # `empties` cannot be empty here. Same shape as
+                # `client._search_videos_merged`'s "raise only if NO endpoint
+                # produced records", one level up.
+                raise empties[0]
         # Outside `_domain_errors` on purpose: this raises HTTPException, which
         # must reach the client as-is and never be re-mapped.
-        next_token = _mint_posts_token(query, served.handle, page)
+        next_token = _mint_posts_token(req.username, filters, token_handle, token_page) if token_handle is not None and token_page is not None else None
+        # Filter + union across the keywords, then order newest-first — one
+        # canonical ordering that everything downstream (`_posts_ids`,
+        # `results`) reads. The sort is a PERMUTATION of `_union_authored_by`'s
+        # output, so `_posts_ids`' guarantee is untouched: every record it can
+        # read ids off still matched the handle on the identity field. The trim
+        # comes AFTER the sort, so what it drops is the LEAST RECENT — `limit`
+        # stays the ceiling on `count` even though it was asked of each keyword
+        # separately.
+        records = _newest_first(_union_authored_by(pages, req.username))[:limit]
         user_id, sec_uid = _posts_ids(req, records)
         # `count` is post-filter and `has_more` is pre-filter, so count=0 with
-        # has_more=true is a normal answer, not a contradiction — a page whose
+        # has_more=true is a normal answer, not a contradiction — pages whose
         # hits were all other authors. Documented on both fields.
+        # `has_more` is ORed across the keywords, like `run_merged` does for a
+        # fan-out: it answers "is there more upstream", and any keyword with
+        # more pages makes that true.
+        # `device` is `+`-joined and de-duplicated: one call per keyword plus
+        # the resolve, so a one-device pool must not report `dev0+dev0+dev0`.
         # `source` / `complete` passed explicitly, for the reason given in
         # `/profile` above: a schema default is not a REQUIRED field, and these
         # two exist precisely so the interim nature is machine-readable.
-        return UserPostsResponse(username=req.username, user_id=user_id, sec_uid=sec_uid, source=POSTS_SOURCE, complete=POSTS_COMPLETE, device=served.label, count=len(records), has_more=page.has_more, page_token=next_token, elapsed_s=round(time.monotonic() - started, 2), results=records)
+        return UserPostsResponse(username=req.username, user_id=user_id, sec_uid=sec_uid, source=POSTS_SOURCE, complete=POSTS_COMPLETE, period=req.period, keywords=keywords, cap_units=cap_units, device='+'.join(dict.fromkeys(devices)), count=len(records), has_more=any(served_page.has_more for served_page in pages), page_token=next_token, elapsed_s=round(time.monotonic() - started, 2), results=records)
 
     @app.get('/health', response_model=HealthResponse, tags=['ops'])
     async def health(pool: ClientPool=Depends(get_pool)) -> HealthResponse:

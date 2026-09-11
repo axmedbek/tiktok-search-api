@@ -429,10 +429,19 @@ def write_identities(path, entries: list[dict], *, stamp: int) -> None:
 
 
 def identity(device_id: str, *, cookie: str = FAKE_COOKIE,
-             token: str = FAKE_TOKEN) -> dict:
+             token: str = FAKE_TOKEN, device_query: dict | None = None) -> dict:
+    """One synthetic identity-file entry. Fake ids, fake cookie, fake token.
+
+    `device_query` replaces the default two-key fingerprint outright, because
+    the KEY NAMES of that mapping are themselves behaviour: `_common_params`
+    replays exactly one identity's keys, so a heterogeneous file (entry A
+    carrying a key entry B does not) is the only shape that can tell an
+    intersection apart from a union over entries. Default None keeps the
+    two-key shape every earlier test was written against."""
     return {'device_id': device_id, 'iid': f'IID-{device_id}',
             'cookie': cookie, 'x_tt_token': token,
-            'device_query': {'device_id': device_id, 'iid': f'IID-{device_id}'}}
+            'device_query': ({'device_id': device_id, 'iid': f'IID-{device_id}'}
+                             if device_query is None else dict(device_query))}
 
 
 def write_config(path, *, identities_name: str = 'ids.json', **extra) -> None:
