@@ -185,6 +185,7 @@
   <header>
     <div class="logo">TT</div>
     <h1>TikTok Search API</h1>
+    <a href="panel.html" style="color:var(--muted);font-size:13px;text-decoration:none;border:1px solid var(--line);background:var(--card);padding:6px 12px;border-radius:22px;">Worker paneli →</a>
     <span class="status"><span class="dot" id="dot"></span><span id="statusText">bağlanılır…</span></span>
   </header>
   <div class="sub">
@@ -538,7 +539,7 @@ function buildBody(q, token){
    interim path searches on the handle); user_id/sec_uid are echoed back, so
    passing the resolved ones keeps them pinned on a page that kept nothing. */
 function postsBody(q, token){
-  const body = {username:q, limit:parseInt($("#limit").value,10)||120};
+  const body = {username:q, limit:parseInt($("#limit").value,10)||120, period:"90"};
   if(profileData && profileData.username) body.username = profileData.username;
   if(profileData && profileData.user_id) body.user_id = profileData.user_id;
   if(profileData && profileData.sec_uid) body.sec_uid = profileData.sec_uid;

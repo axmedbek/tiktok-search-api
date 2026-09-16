@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>TikTok Worker — Panel</title>
+<style>
+  :root{
+    --bg:#0a0b0e; --bg2:#10131a; --card:#14181f; --card2:#1a1f28; --line:#262c37;
+    --txt:#eef1f5; --muted:#8b95a3; --faint:#5a6472;
+    --accent:#25f4ee; --accent2:#fe2c55; --pink:#ff4d78;
+    --ok:#3ddc84; --warn:#ffb638; --err:#ff5c6c;
+    --k-job:#25f4ee; --k-page:#a78bfa; --k-search:#ffb638; --k-post:#3ddc84; --k-worker:#8b95a3;
+    --shadow:0 8px 30px rgba(0,0,0,.35);
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#eef1f5; --bg2:#e4e9ef; --card:#fff; --card2:#f3f6f9; --line:#e0e5ec;
+      --txt:#121722; --muted:#5b6673; --faint:#93a0af;
+      --accent:#00b3ab; --accent2:#fe2c55; --pink:#e02350; --ok:#128a4a;
+      --k-job:#00b3ab; --k-page:#6d4fd8; --k-search:#b07400; --k-post:#128a4a; --k-worker:#5b6673;
+      --shadow:0 8px 28px rgba(30,50,80,.10); }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:
+      radial-gradient(1100px 500px at 85% -8%, color-mix(in srgb,var(--accent) 12%,transparent), transparent 60%),
+      radial-gradient(900px 460px at 10% -6%, color-mix(in srgb,var(--accent2) 12%,transparent), transparent 60%),
+      var(--bg);
+    color:var(--txt);min-height:100vh;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;}
+  .wrap{max-width:1100px;margin:0 auto;padding:30px 18px 70px;}
+  header{display:flex;align-items:center;gap:13px;margin-bottom:4px;flex-wrap:wrap;}
+  .logo{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,var(--accent2),var(--accent));
+    display:grid;place-items:center;font-weight:800;color:#fff;font-size:17px;}
+  h1{font-size:23px;margin:0;font-weight:800;letter-spacing:-.4px;}
+  header a{color:var(--muted);font-size:13px;text-decoration:none;border:1px solid var(--line);
+    background:var(--card);padding:6px 12px;border-radius:22px;}
+  header a:hover{color:var(--txt);}
+  .status{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);
+    background:var(--card);border:1px solid var(--line);padding:6px 13px;border-radius:22px;margin-left:auto;white-space:nowrap;}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--faint);}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 22%,transparent);}
+  .dot.off{background:var(--err);box-shadow:0 0 0 4px color-mix(in srgb,var(--err) 22%,transparent);}
+  .sub{color:var(--muted);margin:8px 0 18px;font-size:13px;}
+  .strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px;box-shadow:var(--shadow);}
+  .stat .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;font-weight:700;}
+  .stat .v{font-size:18px;font-weight:800;margin-top:3px;word-break:break-all;}
+  .stat .v.warn{color:var(--warn)} .stat .v.err{color:var(--err)} .stat .v.ok{color:var(--ok)}
+  .counts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:14px;box-shadow:var(--shadow);}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px;}
+  .chip{padding:5px 11px;border-radius:9px;border:1px solid var(--line);background:var(--card2);color:var(--muted);
+    cursor:pointer;font-weight:600;font-size:12px;user-select:none;}
+  .chip.active{color:#fff;border-color:transparent;background:linear-gradient(135deg,var(--accent2),var(--pink));}
+  .chip .n{opacity:.7;font-weight:500;margin-left:4px;}
+  input[type=text]{flex:1;min-width:160px;padding:9px 12px;border-radius:10px;border:1px solid var(--line);
+    background:var(--bg2);color:var(--txt);font-size:13px;outline:none;}
+  input[type=text]:focus{border-color:var(--accent);}
+  button{padding:8px 14px;border:0;border-radius:10px;font-weight:700;font-size:12.5px;cursor:pointer;color:#fff;
+    background:linear-gradient(135deg,var(--accent2),var(--pink));}
+  button.ghost{background:var(--card2);color:var(--muted);border:1px solid var(--line);}
+  .row{display:grid;grid-template-columns:86px 130px 1fr;gap:10px;align-items:baseline;padding:8px 8px;
+    border-top:1px solid var(--line);cursor:pointer;font-size:13px;}
+  .row:hover{background:var(--card2);}
+  .row .t{color:var(--faint);font-variant-numeric:tabular-nums;font-size:12px;}
+  .badge{display:inline-block;font-size:10.5px;font-weight:800;letter-spacing:.3px;padding:2px 7px;border-radius:6px;
+    color:var(--c);background:color-mix(in srgb,var(--c) 14%,transparent);border:1px solid color-mix(in srgb,var(--c) 32%,transparent);
+    white-space:nowrap;}
+  .row .s{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .row .s b{color:var(--muted);font-weight:600;margin-right:6px;}
+  .row .s a{color:var(--accent);text-decoration:none;}
+  .row.err .s{color:var(--err);}
+  pre{margin:0 8px 10px;padding:12px;background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+    font-size:12px;line-height:1.45;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-word;}
+  .empty{color:var(--muted);padding:26px;text-align:center;}
+  footer{margin-top:26px;color:var(--faint);font-size:12px;}
+  code{font-size:11.5px;background:var(--card2);padding:1px 5px;border-radius:5px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">TT</div>
+    <h1>Worker paneli</h1>
+    <a href="demo.html">← Demo</a>
+    <span class="status"><span class="dot" id="dot"></span><span id="statusText">bağlanılır…</span></span>
+  </header>
+  <div class="sub">RabbitMQ worker-in etdiyi hər şey A→Z: alınan iş, resolve/axtarış, dərc olunan mesaj, ack/nack.
+    Mənbə: <code id="path">—</code></div>
+
+  <div class="strip">
+    <div class="stat"><div class="l">Son hadisə</div><div class="v" id="lastEvent">—</div></div>
+    <div class="stat"><div class="l">Son heartbeat</div><div class="v" id="lastBeat">—</div></div>
+    <div class="stat"><div class="l">Hadisə (son 5000)</div><div class="v" id="total">—</div></div>
+    <div class="stat"><div class="l">Fayl</div><div class="v" id="size">—</div></div>
+  </div>
+  <div class="counts" id="counts"></div>
+
+  <div class="panel">
+    <div class="bar">
+      <span class="chip active" data-k="">hamısı</span>
+      <span class="chip" data-k="job">job</span>
+      <span class="chip" data-k="page">page</span>
+      <span class="chip" data-k="search">search</span>
+      <span class="chip" data-k="post">post</span>
+      <span class="chip" data-k="worker">worker</span>
+      <input type="text" id="q" placeholder="mətn axtarışı (label, url, id…)"/>
+      <button class="ghost" id="pause">⏸ Dayandır</button>
+      <button class="ghost" id="clear">Təmizlə</button>
+    </div>
+    <div id="list"><div class="empty">Hadisə gözlənilir…</div></div>
+  </div>
+
+  <footer>Server: <code id="apiUrl"></code> · dəyişmək üçün <code>?api=http://host:port</code> əlavə edin ·
+    <code>GET /ops/events</code> hər 2 s sorğulanır · worker <code>--events-path</code> ilə eyni fayla yazmalıdır.</footer>
+</div>
+
+<script>
+const API = new URLSearchParams(location.search).get("api") || "http://localhost:8000";
+const POLL_MS = 2000, MAX_ROWS = 2000, PAGE = 500;
+const $ = s => document.querySelector(s);
+$("#apiUrl").textContent = API;
+
+let lastSeq = 0, paused = false, prefix = "", query = "";
+const events = [];          // newest first
+const open = new Set();     // expanded seqs
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const colour = k => `var(--k-${(k||"").split(".")[0]})`;
+const hhmmss = ts => { try{ return new Date(ts).toLocaleTimeString("az", {hour12:false}); }catch{ return ts; } };
+const age = ts => {
+  if(!ts) return "—";
+  const s = Math.max(0, (Date.now() - new Date(ts).getTime())/1000);
+  return s < 60 ? `${s.toFixed(0)} s əvvəl` : s < 3600 ? `${(s/60).toFixed(0)} dəq əvvəl` : `${(s/3600).toFixed(1)} saat əvvəl`;
+};
+const kb = n => n > 1048576 ? `${(n/1048576).toFixed(1)} MB` : `${(n/1024).toFixed(0)} KB`;
+
+function summary(e){
+  const k = e.kind || "";
+  switch(k){
+    case "job.received":   return `alındı · ${e.queue} · tag=${e.delivery_tag}`;
+    case "job.malformed":  return `yanlış format: ${e.error}`;
+    case "job.served":     return `${e.posts} post · ${e.elapsed_s} s`;
+    case "job.acked":      return `ack · ${e.published} mesaj dərc olundu`;
+    case "job.requeued":   return `requeue ${e.retry_in_s} s sonra · ${e.reason}`;
+    case "job.failed":     return `xəta (ack+drop): ${e.error}`;
+    case "page.resolved":  return `@${e.handle} → user_id=${e.user_id} (${e.username ?? "?"})`;
+    case "page.device_feed": return `cihaz: ${e.awemes} aweme → ${e.kept} saxlanıldı · has_more=${e.has_more}`;
+    case "search.request": return `→ ${e.endpoint} ${JSON.stringify(e.body)}`;
+    case "search.response":return `← ${e.endpoint} · ${e.count} nəticə · has_more=${e.has_more}`;
+    case "post.published": return e.post_url ? `→ <a href="${esc(e.post_url)}" target="_blank" rel="noopener">${esc(e.post_url)}</a>` : `→ post_id=${esc(e.post_id)} (url yoxdur)`;
+    case "worker.start":   return `start · ${(e.queues||[]).join(", ")} · source=${e.source} · ${e.api_url}`;
+    case "worker.stop":    return `stop · ${e.reason}`;
+    case "worker.heartbeat": return "heartbeat";
+    default: return JSON.stringify(e).slice(0, 160);
+  }
+}
+const isErr = k => /malformed|failed|requeued|stop/.test(k);
+
+function visible(e){
+  if(prefix && !(e.kind||"").startsWith(prefix)) return false;
+  if(query && !JSON.stringify(e).toLowerCase().includes(query)) return false;
+  return true;
+}
+
+function render(){
+  const rows = events.filter(visible);
+  if(!rows.length){ $("#list").innerHTML = `<div class="empty">Uyğun hadisə yoxdur.</div>`; return; }
+  $("#list").innerHTML = rows.map(e => {
+    const k = e.kind || "";
+    const s = k === "post.published" ? summary(e) : esc(summary(e));
+    const body = open.has(e.seq) ? `<pre>${esc(JSON.stringify(e, null, 2))}</pre>` : "";
+    return `<div class="row${isErr(k)?" err":""}" data-seq="${e.seq}">
+      <span class="t">${esc(hhmmss(e.ts))}</span>
+      <span class="badge" style="--c:${colour(k)}">${esc(k)}</span>
+      <span class="s">${e.label ? `<b>${esc(e.label)}</b>` : ""}${s}</span></div>${body}`;
+  }).join("");
+}
+
+$("#list").addEventListener("click", ev => {
+  if(ev.target.closest("a")) return;
+  const row = ev.target.closest(".row"); if(!row) return;
+  const seq = Number(row.dataset.seq);
+  open.has(seq) ? open.delete(seq) : open.add(seq);
+  render();
+});
+document.querySelectorAll(".chip").forEach(c => c.addEventListener("click", () => {
+  document.querySelectorAll(".chip").forEach(x => x.classList.remove("active"));
+  c.classList.add("active"); prefix = c.dataset.k; render();
+}));
+$("#q").addEventListener("input", ev => { query = ev.target.value.trim().toLowerCase(); render(); });
+$("#pause").addEventListener("click", () => {
+  paused = !paused; $("#pause").textContent = paused ? "▶ Davam et" : "⏸ Dayandır";
+});
+$("#clear").addEventListener("click", () => { events.length = 0; open.clear(); render(); });
+
+async function poll(){
+  if(paused) return;
+  try{
+    const r = await fetch(`${API}/ops/events?after=${lastSeq}&limit=${PAGE}`);
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    $("#dot").className = "dot on";
+    $("#path").textContent = d.path;
+    $("#size").textContent = kb(d.size_bytes);
+    if(d.events.length){
+      lastSeq = d.last_seq;
+      // The server returns file order (oldest first); the timeline shows newest at top.
+      for(const e of d.events) events.unshift(e);
+      if(events.length > MAX_ROWS) events.length = MAX_ROWS;
+      render();
+    }else if(d.last_seq > lastSeq){ lastSeq = d.last_seq; }
+    const newest = events[0];
+    $("#lastEvent").textContent = newest ? age(newest.ts) : "—";
+    $("#lastEvent").className = "v " + (!newest ? "" : (Date.now()-new Date(newest.ts).getTime()) > 120000 ? "warn" : "ok");
+    $("#statusText").textContent = `API ok · seq ${lastSeq}${paused ? " · dayandırılıb" : ""}`;
+  }catch(e){
+    $("#dot").className = "dot off";
+    $("#statusText").textContent = `API əlçatmaz: ${e.message}`;
+  }
+}
+
+async function summarize(){
+  try{
+    const r = await fetch(`${API}/ops/events/summary`);
+    if(!r.ok) return;
+    const d = await r.json();
+    $("#total").textContent = d.total;
+    const beat = $("#lastBeat");
+    beat.textContent = age(d.last_heartbeat_ts);
+    const beatAge = d.last_heartbeat_ts ? (Date.now()-new Date(d.last_heartbeat_ts).getTime())/1000 : Infinity;
+    beat.className = "v " + (beatAge < 75 ? "ok" : beatAge < 300 ? "warn" : "err");
+    $("#counts").innerHTML = Object.entries(d.counts).sort((a,b)=>b[1]-a[1]).map(([k,n]) =>
+      `<span class="badge" style="--c:${colour(k)}">${esc(k)}<span class="n">${n}</span></span>`).join("") || "";
+  }catch{ /* the timeline poll owns the connection status */ }
+}
+
+poll(); summarize();
+setInterval(poll, POLL_MS);
+setInterval(summarize, POLL_MS * 5);
+</script>
+</body>
+</html>

@@ -32,7 +32,10 @@ the package import costs nothing.
 ### Entry schema
 
 One JSON object per file, named `<key>-<captured_at in ns>.json` where `key` is
-the percent-encoded `user_id` the request carried:
+the percent-encoded account uid: the request's `user_id` param when it carries
+one, else the account uid read off the body (see `account_uid`) — measured
+2026-09-14 on 46.9.3, the app's own request carries `sec_user_id` and NO
+`user_id`, so the body is where the key comes from in practice:
 
     {"user_id": "7195575867517944837", "captured_at": 1789012345.678901234,
      "status": "ok", "reason": null, "has_more": true,
@@ -81,8 +84,8 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
-from typing import Any, Collection, Mapping
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Callable, Collection, Iterable, Mapping
 from urllib.parse import parse_qsl, quote, urlsplit
 
 logger = logging.getLogger('tiktoksearch.harvest_spool')
@@ -91,10 +94,30 @@ logger = logging.getLogger('tiktoksearch.harvest_spool')
 # `api32-core-alisg.tiktokv.com` gateway — NOT the `search19-normal` host the
 # signed client uses, and not `/aweme/v1/user/profile/other/`.
 POST_FEED_PATH = '/aweme/v1/aweme/post/'
-# The request param the entry is keyed by. The app sends the profile owner's
-# public uid here, which is the same value `POST /profile` answers with, and is
-# how the driver finds "the newest response for this user".
+# The request param the entry is keyed by WHEN PRESENT: the profile owner's
+# public uid, the same value `POST /profile` answers with, and how the driver
+# finds "the responses for this user". The 46.9.3 app sends `sec_user_id`
+# instead, so the key falls back to the body (`account_uid`).
 USER_ID_PARAM = 'user_id'
+# The profile endpoint the app calls when a profile is opened by its WEB URL
+# (`https://www.tiktok.com/@<handle>`), measured 2026-09-14 on 46.9.3. Its
+# response is what resolves a handle to a uid without a user search.
+PROFILE_PATH = '/tiktok/user/profile/other/v1'
+# A web-profile intent resolves the handle here before fetching the profile.
+# An invalid handle stops at this response: no PROFILE_PATH request follows.
+UNIQUE_ID_PATH = '/aweme/v1/user/uniqueid/'
+UNIQUE_ID_PARAM = 'id'
+# The profile request's own account param (no `user_id` on 46.9.3, measured).
+SEC_USER_ID_PARAM = 'sec_user_id'
+# Profile entries live in a SUB-directory of the spool, so the posts reader's
+# `os.listdir` never sees them and the two key spaces (uid vs handle) cannot
+# collide in one directory.
+PROFILES_DIRNAME = 'profiles'
+# Where the body names the account: every aweme carries `author.uid` (the
+# account's numeric uid, as a string) and a top-level `author_user_id`.
+FIELD_AUTHOR = 'author'
+AUTHOR_UID_KEY = 'uid'
+AWEME_AUTHOR_USER_ID_KEY = 'author_user_id'
 
 DEFAULT_SPOOL_DIRNAME = 'harvest_spool'
 ENTRY_SUFFIX = '.json'
@@ -134,6 +157,45 @@ FIELD_STATUS_CODE = 'status_code'
 FIELD_PATH = 'path'
 FIELD_BYTE_LENGTH = 'byte_length'
 FIELD_AWEME_LIST = 'aweme_list'
+FIELD_STATUS_MSG = 'status_msg'
+# The server's own wording for "this account has no posts" (measured).
+NO_MORE_VIDEOS_MSG = 'No more videos'
+
+STATUS_ERROR = 'error'
+STATUS_UNAVAILABLE = 'unavailable'
+PROFILE_STATUSES = (STATUS_OK, STATUS_ERROR, STATUS_UNAVAILABLE)
+# Measured 2026-09-16: the resolver answered 8196, "Unique ID is invalid",
+# for a profile intent that otherwise timed out and blocked the page queue.
+INVALID_UNIQUE_ID_CODE = 8196
+FIELD_HANDLE = 'handle'
+# Where the profile response keeps each value. MEASURED 2026-09-14 over 241
+# captured `/tiktok/user/profile/other/v1` responses (46.9.3): identity and the
+# post count sit under `common.*`; follower/following/like counts and region sit
+# in a `biz_data` object nested at varying depth under `header.components`;
+# NO `signature` / bio text key exists anywhere in the reply.
+COMMON_KEY = 'common'
+PROFILE_INFO_KEY = 'user_profile_info'
+STATICS_INFO_KEY = 'user_statics_info'
+ACCOUNT_INFO_KEY = 'user_account_info'
+HEADER_KEY = 'header'
+BIZ_DATA_KEY = 'biz_data'
+UID_KEY = 'uid'
+SEC_UID_KEY = 'sec_uid'
+USERNAME_KEY = 'username'
+NICKNAME_KEY = 'nickname'
+AVATAR_KEY = 'avatar'
+AVATAR_VARIANTS = ('avatar_medium', 'avatar_larger', 'avatar_thumb', 'avatar_300x300')
+URL_LIST_KEY = 'url_list'
+AWEME_COUNT_KEY = 'aweme_count'
+HAS_CERT_KEY = 'has_cert'
+PRIVATE_ACCOUNT_KEY = 'is_private_account'
+FOLLOWER_COUNT_KEY = 'follower_count'
+FOLLOWING_COUNT_KEY = 'following_count'
+LIKE_COUNT_KEY = 'like_count'
+REGION_KEY = 'region'
+HEADER_COUNTER_KEYS = (FOLLOWER_COUNT_KEY, FOLLOWING_COUNT_KEY, LIKE_COUNT_KEY, REGION_KEY)
+# Bounded so a hostile or malformed body cannot recurse without limit.
+MAX_HEADER_DEPTH = 12
 
 # Why an entry is unreadable. OUR OWN literals — no part of the body, and no
 # exception text, ever reaches a `reason`: it is written to a file and logged.
@@ -163,9 +225,37 @@ def user_id_from_url(url: str) -> str:
     First value wins on a repeated name — the convention `capture_record.py`
     already uses. An empty string is returned rather than None so the addon's
     guard is one falsiness check and no entry is ever keyed by `'None'`."""
+    return _param_from_url(url, USER_ID_PARAM)
+
+
+def sec_user_id_from_url(url: str) -> str:
+    """The request's `sec_user_id` param, or `''` (same rule as `user_id_from_url`)."""
+    return _param_from_url(url, SEC_USER_ID_PARAM)
+
+
+def _param_from_url(url: str, param: str) -> str:
     for name, value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
-        if name == USER_ID_PARAM:
+        if name == param:
             return value.strip()
+    return ''
+
+
+def account_uid(aweme_list: Iterable[Mapping[str, Any]]) -> str:
+    """The account's numeric uid as the body states it, or `''`.
+
+    The first non-empty `author.uid` across `aweme_list`, else the first
+    non-empty `author_user_id`, coerced to a DECIMAL STRING — a uid that is
+    not an integer is not a uid, and the driver's `USER_ID_PATTERN` would
+    refuse it anyway. `''` for an empty list or a list naming no account, so
+    the caller's guard stays one falsiness check, as with `user_id_from_url`."""
+    for key_path in ((FIELD_AUTHOR, AUTHOR_UID_KEY), (AWEME_AUTHOR_USER_ID_KEY,)):
+        for aweme in aweme_list:
+            value: Any = aweme
+            for key in key_path:
+                value = value.get(key) if isinstance(value, Mapping) else None
+            number = _as_int(value)
+            if number is not None:
+                return str(number)
     return ''
 
 
@@ -333,6 +423,22 @@ class SpoolEntry:
                           ensure_ascii=False)
 
 
+def entry_for_response(*, url: str, captured_at: float, body: bytes | None,
+                       path: str = POST_FEED_PATH) -> SpoolEntry:
+    """The entry for one live response, keyed by URL param else by the body.
+
+    The key is the URL's `user_id` when the request carried one, else the
+    account uid the body names (`account_uid`). The body is parsed ONCE, by
+    `from_response`; the fallback reads the already-built `aweme_list`. An
+    entry with `user_id == ''` means neither source named an account — the
+    caller must not write it, and `write_entry` refuses it anyway."""
+    entry = SpoolEntry.from_response(user_id=user_id_from_url(url), captured_at=captured_at,
+                                     body=body, path=path)
+    if entry.user_id:
+        return entry
+    return replace(entry, user_id=account_uid(entry.aweme_list))
+
+
 def _classify(body: bytes | None) -> tuple[str, str | None, Mapping[str, Any]]:
     """`(status, reason, payload)` for one response body."""
     if body is None:
@@ -348,9 +454,17 @@ def _classify(body: bytes | None) -> tuple[str, str | None, Mapping[str, Any]]:
     if not isinstance(payload, Mapping):
         return STATUS_UNREADABLE, REASON_NOT_OBJECT, {}
     if not isinstance(payload.get(FIELD_AWEME_LIST), list):
-        # PRESENT but empty is an ordinary page and stays `ok`. ABSENT is a
-        # reply we did not understand — `.claude/rules/anti-block.md`: an
-        # unreadable reply is never reported as an empty success.
+        if payload.get(FIELD_STATUS_CODE) == 0 and payload.get(FIELD_STATUS_MSG) == NO_MORE_VIDEOS_MSG:
+            # MEASURED (2026-09-14, account with `aweme_count: 0`): the feed of
+            # an account with no posts is `{"status_code": 0, "status_msg":
+            # "No more videos"}` with NO `aweme_list` key at all. That is an
+            # empty feed the server stated explicitly, not a reply we failed to
+            # read — treating it as unreadable requeued the job forever.
+            return STATUS_OK, None, {**payload, FIELD_AWEME_LIST: []}
+        # PRESENT but empty is an ordinary page and stays `ok`. ABSENT without
+        # that explicit statement is a reply we did not understand —
+        # `.claude/rules/anti-block.md`: an unreadable reply is never reported
+        # as an empty success.
         return STATUS_UNREADABLE, REASON_NO_AWEME_LIST, payload
     return STATUS_OK, None, payload
 
@@ -362,6 +476,186 @@ def _aweme_list(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     return tuple(item for item in raw if isinstance(item, Mapping))
 
 
+@dataclass(frozen=True, slots=True)
+class ProfileEntry:
+    """One full profile or handle-resolution failure, as one spool file.
+
+    `handle` is the file key: the lower-cased `username` the reply names when
+    it is readable, else the request's `sec_user_id` — an error reply names no
+    username. Resolver failures use the requested `id` handle instead, because
+    the app never fetches a profile for an invalid handle. Every
+    counter is None when the reply did not carry it (`signature` never does —
+    measured, see `HEADER_COUNTER_KEYS`)."""
+
+    handle: str
+    captured_at: float
+    status: str
+    status_code: int | None
+    status_msg: str | None
+    user_id: str | None
+    sec_uid: str | None
+    username: str | None
+    nickname: str | None
+    avatar_url: str | None
+    follower_count: int | None
+    following_count: int | None
+    aweme_count: int | None
+    heart_count: int | None
+    signature: str | None
+    verified: bool
+    private: bool
+    region_code: str | None
+
+    @property
+    def is_ok(self) -> bool:
+        """Whether this entry resolved a handle to an account."""
+        return self.status == STATUS_OK and bool(self.user_id)
+
+    @property
+    def is_unavailable(self) -> bool:
+        """Whether the resolver explicitly rejected this requested handle."""
+        return self.status == STATUS_UNAVAILABLE and self.status_code == INVALID_UNIQUE_ID_CODE
+
+    @classmethod
+    def from_resolver_response(cls, *, url: str, captured_at: float,
+                               body: bytes | None) -> 'ProfileEntry | None':
+        """Capture a handle resolver failure; a success awaits the full profile.
+
+        The request's handle is essential: an invalid-handle reply contains
+        no user object. Only the measured rejection code proves absence;
+        malformed or unfamiliar replies remain ordinary, retryable errors.
+        """
+        payload = _json_object(body)
+        raw_code = payload.get(FIELD_STATUS_CODE)
+        # Do not truncate a malformed float or coerce bool into a status code.
+        status_code = _as_int(raw_code) if isinstance(raw_code, (str, int)) and not isinstance(raw_code, bool) else None
+        if status_code == 0:
+            return None
+        handle = _param_from_url(url, UNIQUE_ID_PARAM).strip().lower()
+        status = STATUS_UNAVAILABLE if status_code == INVALID_UNIQUE_ID_CODE else STATUS_ERROR
+        return cls(handle=handle, captured_at=float(captured_at), status=status, status_code=status_code,
+                   status_msg=_str_or_none(payload.get(FIELD_STATUS_MSG)), user_id=None, sec_uid=None,
+                   username=None, nickname=None, avatar_url=None, follower_count=None,
+                   following_count=None, aweme_count=None, heart_count=None, signature=None,
+                   verified=False, private=False, region_code=None)
+
+    @classmethod
+    def from_response(cls, *, url: str, captured_at: float, body: bytes | None) -> 'ProfileEntry':
+        """The entry for one live profile response, keyed by username else `sec_user_id`."""
+        payload = _json_object(body)
+        status_code = _as_int(payload.get(FIELD_STATUS_CODE))
+        status_msg = _str_or_none(payload.get(FIELD_STATUS_MSG))
+        common = _mapping(payload.get(COMMON_KEY))
+        info = _mapping(common.get(PROFILE_INFO_KEY))
+        username = _str_or_none(info.get(USERNAME_KEY))
+        uid = _as_int(info.get(UID_KEY))
+        if status_code != 0 or username is None or uid is None:
+            return cls(handle=username.lower() if username else sec_user_id_from_url(url),
+                       captured_at=float(captured_at), status=STATUS_ERROR, status_code=status_code,
+                       status_msg=status_msg, user_id=str(uid) if uid is not None else None, sec_uid=None,
+                       username=username, nickname=None, avatar_url=None, follower_count=None,
+                       following_count=None, aweme_count=None, heart_count=None, signature=None,
+                       verified=False, private=False, region_code=None)
+        statics = _mapping(common.get(STATICS_INFO_KEY))
+        account = _mapping(common.get(ACCOUNT_INFO_KEY))
+        header = _header_counters(payload.get(HEADER_KEY))
+        region = _str_or_none(header.get(REGION_KEY))
+        return cls(handle=username.lower(), captured_at=float(captured_at), status=STATUS_OK,
+                   status_code=status_code, status_msg=status_msg, user_id=str(uid),
+                   sec_uid=_str_or_none(info.get(SEC_UID_KEY)), username=username,
+                   nickname=_str_or_none(info.get(NICKNAME_KEY)), avatar_url=_avatar_url(info.get(AVATAR_KEY)),
+                   follower_count=_as_int(header.get(FOLLOWER_COUNT_KEY)),
+                   following_count=_as_int(header.get(FOLLOWING_COUNT_KEY)),
+                   aweme_count=_as_int(statics.get(AWEME_COUNT_KEY)),
+                   heart_count=_as_int(header.get(LIKE_COUNT_KEY)), signature=None,
+                   verified=_as_bool(account.get(HAS_CERT_KEY)), private=_as_bool(account.get(PRIVATE_ACCOUNT_KEY)),
+                   region_code=region.upper() if region else None)
+
+    @classmethod
+    def from_mapping(cls, data: object) -> 'ProfileEntry':
+        """One parsed profile file, validated at this boundary (`ValueError` when unusable)."""
+        if not isinstance(data, Mapping):
+            raise ValueError(f'expected a JSON object, got {type(data).__name__}')
+        handle = data.get(FIELD_HANDLE)
+        if not isinstance(handle, str) or not handle.strip():
+            raise ValueError(f'{FIELD_HANDLE!r} missing or not a non-empty string')
+        captured_at = data.get(FIELD_CAPTURED_AT)
+        if isinstance(captured_at, bool) or not isinstance(captured_at, (int, float)):
+            raise ValueError(f'{FIELD_CAPTURED_AT!r} missing or not a number')
+        status = data.get(FIELD_STATUS)
+        if status not in PROFILE_STATUSES:
+            raise ValueError(f'{FIELD_STATUS!r} is not one of {", ".join(PROFILE_STATUSES)}')
+        user_id = _as_int(data.get(FIELD_USER_ID))
+        return cls(handle=handle.strip(), captured_at=float(captured_at), status=status,
+                   status_code=_as_int(data.get(FIELD_STATUS_CODE)), status_msg=_str_or_none(data.get(FIELD_STATUS_MSG)),
+                   user_id=str(user_id) if user_id is not None else None,
+                   sec_uid=_str_or_none(data.get('sec_uid')), username=_str_or_none(data.get('username')),
+                   nickname=_str_or_none(data.get('nickname')), avatar_url=_str_or_none(data.get('avatar_url')),
+                   follower_count=_as_int(data.get('follower_count')), following_count=_as_int(data.get('following_count')),
+                   aweme_count=_as_int(data.get('aweme_count')), heart_count=_as_int(data.get('heart_count')),
+                   signature=_str_or_none(data.get('signature')), verified=_as_bool(data.get('verified')),
+                   private=_as_bool(data.get('private')), region_code=_str_or_none(data.get('region_code')))
+
+    def as_json(self) -> str:
+        """This entry as the JSON text of one profile spool file."""
+        return json.dumps(asdict(self), ensure_ascii=False)
+
+
+def _json_object(body: bytes | None) -> Mapping[str, Any]:
+    if not body:
+        return {}
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _str_or_none(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _avatar_url(avatar: Any) -> str | None:
+    """The first URL of the first populated avatar variant, or None."""
+    avatar = _mapping(avatar)
+    for variant in AVATAR_VARIANTS:
+        urls = _mapping(avatar.get(variant)).get(URL_LIST_KEY)
+        if isinstance(urls, list):
+            for url in urls:
+                if isinstance(url, str) and url:
+                    return url
+    return None
+
+
+def _header_counters(header: Any) -> dict[str, Any]:
+    """`HEADER_COUNTER_KEYS` values found in any `biz_data` object under `header`.
+
+    First occurrence of each key wins; depth-bounded walk over dicts and lists."""
+    found: dict[str, Any] = {}
+    stack: list[tuple[Any, int]] = [(header, 0)]
+    while stack and len(found) < len(HEADER_COUNTER_KEYS):
+        node, depth = stack.pop()
+        if depth > MAX_HEADER_DEPTH:
+            continue
+        if isinstance(node, Mapping):
+            biz = node.get(BIZ_DATA_KEY)
+            if isinstance(biz, Mapping):
+                for key in HEADER_COUNTER_KEYS:
+                    if key not in found and biz.get(key) is not None:
+                        found[key] = biz[key]
+            stack.extend((child, depth + 1) for child in node.values())
+        elif isinstance(node, list):
+            stack.extend((child, depth + 1) for child in node)
+    return found
+
+
 def write_entry(spool_dir: str, entry: SpoolEntry) -> str:
     """Write `entry` into `spool_dir` atomically; return the path written.
 
@@ -370,15 +664,30 @@ def write_entry(spool_dir: str, entry: SpoolEntry) -> str:
     see the whole entry or no file at all — the invariant
     `.claude/rules/learned-lessons.md` records for `identities.json`, and the
     reason the driver may parse a spool file the moment it appears."""
-    key = file_key(entry.user_id)
+    return _write_json(spool_dir, key=file_key(entry.user_id), captured_at=entry.captured_at,
+                       text=entry.as_json(), what='user_id')
+
+
+def write_profile_entry(spool_dir: str, entry: 'ProfileEntry') -> str:
+    """Write a profile `entry` under `<spool_dir>/profiles/` atomically (see `write_entry`)."""
+    return _write_json(profiles_dir(spool_dir), key=file_key(entry.handle), captured_at=entry.captured_at,
+                       text=entry.as_json(), what='handle')
+
+
+def profiles_dir(spool_dir: str) -> str:
+    """Where profile entries live: a sub-directory of the posts spool."""
+    return os.path.join(spool_dir, PROFILES_DIRNAME)
+
+
+def _write_json(directory: str, *, key: str, captured_at: float, text: str, what: str) -> str:
     if not key:
-        raise ValueError('entry has no usable user_id to key a file by')
-    os.makedirs(spool_dir, exist_ok=True)
-    target = os.path.join(spool_dir, _free_name(spool_dir, entry))
-    handle_fd, temp_path = tempfile.mkstemp(dir=spool_dir, prefix=TEMP_PREFIX, suffix=TEMP_SUFFIX)
+        raise ValueError(f'entry has no usable {what} to key a file by')
+    os.makedirs(directory, exist_ok=True)
+    target = os.path.join(directory, _free_name(directory, key, captured_at))
+    handle_fd, temp_path = tempfile.mkstemp(dir=directory, prefix=TEMP_PREFIX, suffix=TEMP_SUFFIX)
     try:
         with os.fdopen(handle_fd, 'w', encoding='utf-8') as handle:
-            handle.write(entry.as_json())
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, target)
@@ -394,12 +703,11 @@ def write_entry(spool_dir: str, entry: SpoolEntry) -> str:
     return target
 
 
-def _free_name(spool_dir: str, entry: SpoolEntry) -> str:
-    stamp = int(entry.captured_at * NANOS_PER_SECOND)
-    key = file_key(entry.user_id)
+def _free_name(directory: str, key: str, captured_at: float) -> str:
+    stamp = int(captured_at * NANOS_PER_SECOND)
     for offset in range(MAX_NAME_ATTEMPTS):
         name = f'{key}{NAME_SEP}{stamp + offset}{ENTRY_SUFFIX}'
-        if not os.path.exists(os.path.join(spool_dir, name)):
+        if not os.path.exists(os.path.join(directory, name)):
             return name
     raise OSError(f'no free entry name for {key} after {MAX_NAME_ATTEMPTS} attempts')
 
@@ -413,7 +721,10 @@ class FileSpool:
     * `entry_names` is the CENSUS, taken before the intent is fired. It is
       clock-free, so it holds an entry from a previous visit out of the running
       whatever the two processes' clocks say.
-    * `newest_since` applies the census and the timestamp together.
+    * `entries_since` applies the census and the timestamp together and
+      returns EVERY eligible entry — one profile visit makes the app fetch two
+      posts pages (measured: `count=9` then `count=18`), and the driver merges
+      them. `newest_since` is the single-entry view of the same rule.
 
     Injected into the driver as an object so a unit test can substitute a fake
     and no test needs a Waydroid container or a mitmproxy."""
@@ -435,26 +746,25 @@ class FileSpool:
         key = file_key(user_id)
         if not key:
             return frozenset()
-        prefix = f'{key}{NAME_SEP}'
-        try:
-            names = os.listdir(self._dir)
-        except FileNotFoundError:
-            logger.debug('spool directory %s does not exist yet', self._dir)
-            return frozenset()
-        except OSError as exc:
-            logger.warning('cannot list spool directory %s: %s', self._dir, exc)
-            return frozenset()
-        return frozenset(name for name in names
-                         if name.startswith(prefix) and name.endswith(ENTRY_SUFFIX))
+        return _names(self._dir, prefix=f'{key}{NAME_SEP}')
 
-    def newest_since(self, user_id: str, *, after: float,
-                     exclude: Collection[str] = ()) -> SpoolEntry | None:
-        """The newest ELIGIBLE entry for `user_id`, or None.
+    def all_entry_names(self) -> frozenset[str]:
+        """Every entry file name in the spool, for ANY account.
+
+        The census `visit_handle` takes before firing: the visit does not know
+        the account's uid yet (the profile reply is what tells it), so the whole
+        directory is snapshotted and the uid filter is applied by the poll."""
+        return _names(self._dir, prefix='')
+
+    def entries_since(self, user_id: str, *, after: float,
+                      exclude: Collection[str] = ()) -> dict[str, SpoolEntry]:
+        """Every ELIGIBLE entry for `user_id`, file name -> entry, oldest first.
 
         Eligible means all three of:
 
         1. the file name is not in `exclude` — the census taken before the
-           visit, which is the clock-free half of the stale-entry guard;
+           visit, which is the clock-free half of the stale-entry guard, plus
+           whatever the driver has already merged this visit;
         2. the entry's own `captured_at` is at or after `after`, which rejects
            a previous visit's response that landed between the census and the
            intent — the census cannot see that one;
@@ -462,10 +772,10 @@ class FileSpool:
            percent-encoding collision in a file name can never serve one
            account's feed as another's.
 
-        None means nothing eligible is there YET. It is not an error and it is
-        not an empty feed: an entry whose `aweme_list` is empty is returned as
-        an entry."""
-        best: SpoolEntry | None = None
+        Keyed by FILE NAME so the driver can extend its exclusion set with what
+        it has merged and never read the same entry twice. Empty means nothing
+        eligible is there YET — not an error and not an empty feed."""
+        found: list[tuple[str, SpoolEntry]] = []
         after_nanos = int(after * NANOS_PER_SECOND)
         for name in sorted(self.entry_names(user_id)):
             if name in exclude:
@@ -478,23 +788,88 @@ class FileSpool:
             entry = self._read(name)
             if entry is None or entry.user_id != user_id.strip() or entry.captured_at < after:
                 continue
-            if best is None or entry.captured_at > best.captured_at:
-                best = entry
-        return best
+            found.append((name, entry))
+        found.sort(key=lambda pair: pair[1].captured_at)
+        return dict(found)
+
+    def newest_since(self, user_id: str, *, after: float,
+                     exclude: Collection[str] = ()) -> SpoolEntry | None:
+        """The newest eligible entry for `user_id` (`entries_since`'s rule), or None."""
+        entries = self.entries_since(user_id, after=after, exclude=exclude)
+        return max(entries.values(), key=lambda entry: entry.captured_at, default=None)
 
     def _read(self, name: str) -> SpoolEntry | None:
-        full = os.path.join(self._dir, name)
-        try:
-            with open(full, 'r', encoding='utf-8') as handle:
-                payload = json.load(handle)
-        except (OSError, ValueError) as exc:
-            # The file NAME and the error, never the content: an entry holds a
-            # whole feed. A single unusable file must not fail a visit that
-            # another file could still serve.
-            logger.warning('skipping unusable spool entry %s: %s', name, exc)
-            return None
-        try:
-            return SpoolEntry.from_mapping(payload)
-        except ValueError as exc:
-            logger.warning('skipping unusable spool entry %s: %s', name, exc)
-            return None
+        return _read_entry(self._dir, name, SpoolEntry.from_mapping)
+
+
+class ProfileSpool:
+    """`<spool_dir>/profiles/`, as the device driver reads it.
+
+    Mirrors `FileSpool` — the same census + timestamp + own-key rule — keyed
+    by HANDLE: the caller passes the handle as typed, and it is lower-cased
+    and `file_key`-encoded here, exactly as the addon keys what it writes."""
+
+    def __init__(self, spool_dir: str) -> None:
+        self._dir = profiles_dir(spool_dir)
+
+    @property
+    def path(self) -> str:
+        """The directory this spool reads."""
+        return self._dir
+
+    def entry_names(self, handle: str) -> frozenset[str]:
+        """Every profile entry file name currently present for `handle`."""
+        key = file_key(handle.lower())
+        if not key:
+            return frozenset()
+        return _names(self._dir, prefix=f'{key}{NAME_SEP}')
+
+    def newest_since(self, handle: str, *, after: float,
+                     exclude: Collection[str] = ()) -> ProfileEntry | None:
+        """The newest eligible profile entry for `handle` (`FileSpool.entries_since`'s rule), or None."""
+        wanted = handle.strip().lower()
+        after_nanos = int(after * NANOS_PER_SECOND)
+        newest: ProfileEntry | None = None
+        for name in self.entry_names(wanted):
+            if name in exclude:
+                continue
+            stamp = nanos_from_name(name)
+            if stamp is not None and stamp < after_nanos:
+                continue
+            entry = _read_entry(self._dir, name, ProfileEntry.from_mapping)
+            if entry is None or entry.handle != wanted or entry.captured_at < after:
+                continue
+            if newest is None or entry.captured_at >= newest.captured_at:
+                newest = entry
+        return newest
+
+
+def _names(directory: str, *, prefix: str) -> frozenset[str]:
+    """Entry file names in `directory` starting with `prefix`; absent dir = empty."""
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        logger.debug('spool directory %s does not exist yet', directory)
+        return frozenset()
+    except OSError as exc:
+        logger.warning('cannot list spool directory %s: %s', directory, exc)
+        return frozenset()
+    return frozenset(name for name in names if name.startswith(prefix) and name.endswith(ENTRY_SUFFIX))
+
+
+def _read_entry(directory: str, name: str, parse: Callable[[object], Any]) -> Any | None:
+    full = os.path.join(directory, name)
+    try:
+        with open(full, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        # The file NAME and the error, never the content: an entry holds a
+        # whole feed. A single unusable file must not fail a visit that
+        # another file could still serve.
+        logger.warning('skipping unusable spool entry %s: %s', name, exc)
+        return None
+    try:
+        return parse(payload)
+    except ValueError as exc:
+        logger.warning('skipping unusable spool entry %s: %s', name, exc)
+        return None

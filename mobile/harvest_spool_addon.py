@@ -7,8 +7,9 @@ HTTP 200 with a 0-byte body and `tt_orcas_res: 1`; the app's own signature
 works, and still worked replayed from plain `curl` 611 s later). Its traffic is
 already decrypted by the mitmproxy this project runs for identity capture — so
 this addon taps it and writes each response into a spool directory, one JSON
-file per response, keyed by the request's `user_id`. `device/driver.py` opens a
-profile by intent and reads the newest entry that visit produced.
+file per response, keyed by the account uid (the request's `user_id` param, or
+the body's `author.uid` when the request carries none). `device/driver.py`
+opens a profile by intent and merges the entries that visit produced.
 
     # from the `mobile/` directory, ALONGSIDE the existing capture. `-w` and
     # every other `-s` keep working: this addon only READS flow objects — it
@@ -56,9 +57,9 @@ from mitmproxy import ctx, http
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoksearch'))
 
 from capture_record import is_tiktok_host, path_from_url  # noqa: E402
-from harvest_spool import (POST_FEED_PATH, USER_ID_PARAM,  # noqa: E402
-                           SpoolEntry, default_spool_dir, user_id_from_url,
-                           write_entry)
+from harvest_spool import (POST_FEED_PATH, PROFILE_PATH, STATUS_OK, UNIQUE_ID_PATH, USER_ID_PARAM,  # noqa: E402
+                           ProfileEntry, default_spool_dir, entry_for_response,
+                           write_entry, write_profile_entry)
 
 logger = logging.getLogger('harvest_spool')
 
@@ -95,17 +96,33 @@ class HarvestSpool:
         # whole `/aweme/v1/` family for the param diff, and this spool is one
         # endpoint's response bodies. A prefix here would fill the directory
         # with feeds the driver never reads.
-        if path_from_url(url) != self._path:
+        path = path_from_url(url)
+        if path == UNIQUE_ID_PATH:
+            self._spool_resolver(url, flow.response)
             return
-        user_id = user_id_from_url(url)
-        if not user_id:
-            # Nothing to key on, so nothing a driver could ever find. Logged
-            # because a post-feed request without a `user_id` would mean the
-            # app's param set changed.
-            logger.warning('post-feed response with no %s param, not spooled', USER_ID_PARAM)
+        if path == PROFILE_PATH:
+            self._spool_profile(url, flow.response)
             return
-        entry = SpoolEntry.from_response(user_id=user_id, captured_at=time.time(),
-                                         body=_body(flow.response), path=self._path)
+        if path != self._path:
+            return
+        # Keyed by the URL's `user_id` when present, else by the account uid
+        # the body names — the 46.9.3 app sends `sec_user_id` and no `user_id`
+        # (measured 2026-09-14), so the body is the usual source.
+        entry = entry_for_response(url=url, captured_at=time.time(), body=_body(flow.response),
+                                   path=self._path)
+        if not entry.user_id:
+            # Nothing to key on, so nothing a driver could ever find. Counts
+            # and flags only — never the body.
+            # The body of a SMALL unreadable reply is TikTok's own error text
+            # (measured: `status_msg`, no user data) and is the only thing that
+            # tells a private account from a risk-control refusal, so its head
+            # is logged; a large body is never logged.
+            snippet = _snippet(flow.response) if entry.status != STATUS_OK and entry.byte_length <= MAX_SNIPPET_BYTES else ''
+            logger.warning('post-feed response with no %s param and no account uid in the body, '
+                           'not spooled (status=%s aweme_list=%d bytes=%d)%s',
+                           USER_ID_PARAM, entry.status, len(entry.aweme_list), entry.byte_length, snippet)
+            return
+        user_id = entry.user_id
         try:
             target = write_entry(self._dir, entry)
         except (OSError, ValueError) as exc:
@@ -116,6 +133,46 @@ class HarvestSpool:
         logger.info('spooled #%d %s: user_id=%s status=%s aweme_list=%d has_more=%s bytes=%d',
                     self._written, os.path.basename(target), user_id, entry.status,
                     len(entry.aweme_list), entry.has_more, entry.byte_length)
+
+
+    def _spool_resolver(self, url: str, response: http.Response) -> None:
+        entry = ProfileEntry.from_resolver_response(url=url, captured_at=time.time(), body=_body(response))
+        # Successful resolution carries no full profile; its later profile
+        # response must remain the source of account fields and feed ownership.
+        if entry is None:
+            return
+        self._write_profile(entry, path=UNIQUE_ID_PATH)
+
+    def _spool_profile(self, url: str, response: http.Response) -> None:
+        # The handle -> uid resolve the driver waits for. Keyed by the reply's
+        # own username, else by the request's `sec_user_id` for an error reply.
+        entry = ProfileEntry.from_response(url=url, captured_at=time.time(), body=_body(response))
+        self._write_profile(entry, path=PROFILE_PATH)
+
+    def _write_profile(self, entry: ProfileEntry, *, path: str) -> None:
+        if not entry.handle:
+            logger.warning('%s response with no account key, not spooled (status_code=%s)', path, entry.status_code)
+            return
+        try:
+            target = write_profile_entry(self._dir, entry)
+        except (OSError, ValueError) as exc:
+            logger.error('failed to spool a %s response: %s', path, exc)
+            return
+        # Counts and flags only.
+        logger.info('spooled profile %s: status=%s status_code=%s user_id=%s aweme_count=%s',
+                    os.path.basename(target), entry.status, entry.status_code, entry.user_id, entry.aweme_count)
+
+
+MAX_SNIPPET_BYTES = 600
+
+
+def _snippet(response: http.Response) -> str:
+    """` body=<head of the body>` for a small error reply, or '' when unreadable."""
+    try:
+        raw = response.content or b''
+    except ValueError:
+        return ''
+    return ' body=' + raw[:MAX_SNIPPET_BYTES].decode('utf-8', errors='replace')
 
 
 def _body(response: http.Response) -> bytes | None:

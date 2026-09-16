@@ -33,6 +33,11 @@ logger = logging.getLogger('tiktoksearch.identity')
 
 # Consecutive empty/shadow-blocked results before an identity is retired.
 DEFAULT_STALE_AFTER = 3
+# Seconds a stale identity sits out before it is tried again. Measured: a
+# `hit_limit` (per-device search RATE limit, not expired credentials) lifted by
+# itself after ~6 minutes, so a stale flag that can only be cleared by a
+# credential refresh or a restart turns a temporary limit into a permanent 503.
+DEFAULT_STALE_COOLDOWN_S = 600.0
 # The captured argus pair, named as one unit because that is what it is: the
 # two halves are only ever carried, compared and rejected together.
 DYN_PAIR_FIELDS: tuple[str, str] = ('dyn_seed', 'dyn_rand')
@@ -59,6 +64,10 @@ class Identity:
     consecutive_empty: int = 0
     stale: bool = False
     last_ok: float = 0.0
+    # Wall clock of the moment `stale` last tipped True; `is_usable` lets the
+    # identity back into rotation `stale_cooldown_s` after it.
+    stale_since: float = 0.0
+    stale_cooldown_s: float = DEFAULT_STALE_COOLDOWN_S
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -110,6 +119,7 @@ class Identity:
             self.consecutive_empty += 1
             if not self.stale and self.consecutive_empty >= stale_after:
                 self.stale = True
+                self.stale_since = time.time()
                 logger.warning(
                     'identity %s marked STALE after %d consecutive empty results '
                     '(cookie/x-tt-token likely expired — needs refresh)',
@@ -118,8 +128,21 @@ class Identity:
             return False
 
     def is_usable(self) -> bool:
+        """Not stale — or stale long enough that the cooldown has elapsed.
+
+        The first check after the cooldown clears the flag and the empty
+        counter, so the identity earns its way back to stale only through
+        `stale_after` FRESH empties, exactly as it did the first time."""
         with self._lock:
-            return not self.stale
+            if not self.stale:
+                return True
+            waited = time.time() - self.stale_since
+            if waited < self.stale_cooldown_s:
+                return False
+            self.stale = False
+            self.consecutive_empty = 0
+            logger.info('identity %s back in rotation after %.0fs cooldown', self.key, waited)
+            return True
 
 
 def _dyn_rand(entry: Mapping[str, Any]) -> int | None:
@@ -165,9 +188,11 @@ class IdentityStore:
     is treated as refreshed (health reset)."""
 
     def __init__(self, path: str | os.PathLike[str], *,
-                 stale_after: int = DEFAULT_STALE_AFTER) -> None:
+                 stale_after: int = DEFAULT_STALE_AFTER,
+                 stale_cooldown_s: float = DEFAULT_STALE_COOLDOWN_S) -> None:
         self._path = os.fspath(path)
         self._stale_after = max(1, stale_after)
+        self._stale_cooldown_s = float(stale_cooldown_s)
         self._lock = threading.Lock()
         self._identities: dict[str, Identity] = {}
         self._mtime: float | None = None
@@ -222,6 +247,7 @@ class IdentityStore:
                         device_query=entry.get('device_query') or {},
                         dyn_seed=entry.get('dyn_seed') or None,
                         dyn_rand=_dyn_rand(entry),
+                        stale_cooldown_s=self._stale_cooldown_s,
                     )
                 except ValueError as exc:
                     # A half pair, or a `dyn_rand` that is not a number. The
@@ -239,6 +265,7 @@ class IdentityStore:
                         and prev.dyn_seed == ident.dyn_seed and prev.dyn_rand == ident.dyn_rand):
                     ident.consecutive_empty = prev.consecutive_empty
                     ident.stale = prev.stale
+                    ident.stale_since = prev.stale_since
                     ident.last_ok = prev.last_ok
                 elif prev is not None:
                     logger.info('identity %s refreshed (new credentials) — health reset', key)
@@ -269,6 +296,10 @@ class IdentityStore:
     @property
     def stale_after(self) -> int:
         return self._stale_after
+
+    @property
+    def stale_cooldown_s(self) -> float:
+        return self._stale_cooldown_s
 
     def report_ok(self, key: str) -> None:
         ident = self.get(key)

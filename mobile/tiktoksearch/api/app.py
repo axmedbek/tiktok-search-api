@@ -6,16 +6,21 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from functools import partial
 from typing import Callable, Iterator
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from ..client import SEARCH_ITEM_PATH, SEARCH_PATHS, SEARCH_VIDEO_PATH, TikTokClient
-from ..config import RAPIDAPI_KEY_ENV, SIGNER_LEGACY, SIGNER_RAPID, PoolConfig
+from ..broker.device_source import device_records
+from ..config import RAPIDAPI_KEY_ENV, SIGNER_LEGACY, SIGNER_RAPID, DeviceSourceConfig, PoolConfig
+from ..device.driver import BACKEND_ADB, DeviceConfig, DeviceDriver
+from ..device.errors import DeviceError, ProfileUnavailable
 from ..errors import NotFound, PoolCode, PoolExhausted, RateLimited, SoftError, TransportError
 from ..filters import SearchFilters, SearchKind, SearchPage, SearchQuery
+from ..harvest_spool import default_spool_dir
 from ..identity_manager import IdentityStore
 from ..paging import TOKEN_VERSION, PageToken, decode, encode, query_hash
 from ..pool import CallOutcome, ClientPool, HealthVerdict, posts_verdict
-from .schemas import MAX_QUERY_CHARS, POSTS_COMPLETE, POSTS_SOURCE, PROFILE_SOURCE, HealthResponse, ProfileRequest, ProfileResponse, SearchRequest, SearchResponse, UserPostsRequest, UserPostsResponse
+from ..broker.events import default_events_path, events_file_size, read_events, read_tail
+from .schemas import DEVICE_SOURCE, EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT, EVENTS_SUMMARY_WINDOW, HEARTBEAT_KIND, MAX_QUERY_CHARS, POSTS_COMPLETE, POSTS_SOURCE, PROFILE_SOURCE, EventsResponse, EventsSummaryResponse, HealthResponse, ProfileRequest, ProfileResponse, SearchRequest, SearchResponse, UserPostsRequest, UserPostsResponse
 logger = logging.getLogger('tiktoksearch.api')
 DEFAULT_CONFIG_PATH = 'config_signed.yaml'
 # Optional hot-reloadable warm-identity file. Env override wins; else config's
@@ -491,6 +496,24 @@ def _domain_errors() -> Iterator[None]:
 def get_pool(request: Request) -> ClientPool:
     return request.app.state.pool
 
+# `/user/posts` when the device harvest failed. The exception CLASS only: a
+# `DeviceError` message can carry the adb command line (`.claude/rules/security.md`).
+DEVICE_HARVEST_FAILED_DETAIL = 'device harvest failed: {kind}'
+DEVICE_SOURCE_ON_MSG = 'Device posts source ON: /user/posts reads the app feed via adb (spool_dir=%s).'
+
+
+def _build_device_driver(cfg: DeviceSourceConfig) -> DeviceDriver | None:
+    """The `DeviceDriver` for `device_posts:`, or None when the knob is off."""
+    if not cfg.enabled:
+        return None
+    spool_dir = cfg.spool_dir or default_spool_dir()
+    device_config = DeviceConfig(spool_dir=spool_dir, intent_backend=BACKEND_ADB, adb_binary=cfg.adb_binary,
+                                 adb_serial=cfg.adb_serial, app_package=cfg.app_package,
+                                 harvest_timeout_s=cfg.harvest_timeout_s, settle_s=cfg.settle_s,
+                                 poll_interval_s=cfg.poll_interval_s)
+    logger.info(DEVICE_SOURCE_ON_MSG, spool_dir)
+    return DeviceDriver(device_config)
+
 def _resolve_identities_path(config_path: str) -> str | None:
     """Where to read hot-reloadable warm identities from, if anywhere."""
     env = os.environ.get(IDENTITIES_ENV)
@@ -532,10 +555,11 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        identities = IdentityStore(identities_path) if identities_path else None
+        identities = IdentityStore(identities_path, stale_cooldown_s=config.stale_cooldown_s) if identities_path else None
         app.state.identities = identities
         app.state.pool = ClientPool(config, identities=identities)
         app.state.config = config
+        app.state.device_driver = _build_device_driver(config.device_posts)
         status = app.state.pool.status()
         if identities is not None:
             logger.info('Warm-identity store: %s (%d usable).', identities_path, identities.usable_count())
@@ -658,6 +682,9 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
         device on a page this endpoint then filters down anyway."""
         started = time.monotonic()
         loop = asyncio.get_running_loop()
+        driver: DeviceDriver | None = getattr(app.state, 'device_driver', None)
+        if driver is not None and req.page_token is None:
+            return await _device_posts(req, pool, driver, loop, started)
         # `filters.py` is THE mechanism for this — the same `SearchFilters`
         # `/search` ships, emitting the same flat v46 `publish_time` param. No
         # parallel recency path.
@@ -756,9 +783,58 @@ def create_app(config_path: str=DEFAULT_CONFIG_PATH) -> FastAPI:
         # two exist precisely so the interim nature is machine-readable.
         return UserPostsResponse(username=req.username, user_id=user_id, sec_uid=sec_uid, source=POSTS_SOURCE, complete=POSTS_COMPLETE, period=req.period, keywords=keywords, cap_units=cap_units, device='+'.join(dict.fromkeys(devices)), count=len(records), has_more=any(served_page.has_more for served_page in pages), page_token=next_token, elapsed_s=round(time.monotonic() - started, 2), results=records)
 
+    async def _device_posts(req: UserPostsRequest, pool: ClientPool, driver: DeviceDriver,
+                            loop: asyncio.AbstractEventLoop, started: float) -> UserPostsResponse:
+        """`/user/posts` from the account's OWN feed, read off the app on a device.
+
+        The handle → `user_id` resolve is done BY THE DEVICE too
+        (`DeviceDriver.visit_handle` opens the profile's web URL; the app calls
+        the profile endpoint the spool captures), so NO signed request is
+        issued at all and `cap_units` is 0. `ProfileUnavailable` — TikTok said
+        the account is not there — is 404, as `NotFound` is on the search
+        path. `complete` is the feed's own `has_more`, negated. No `page_token`
+        is minted: a continuation falls through to the search path."""
+        limit = min(req.limit, config.max_results_per_search)
+        try:
+            profile, feed = await loop.run_in_executor(None, partial(driver.visit_handle, req.username, want=limit))
+        except ProfileUnavailable as exc:
+            raise HTTPException(status_code=404, detail=NO_SUCH_USER_DETAIL) from exc
+        except DeviceError as exc:
+            logger.warning('device harvest failed for username=%s', req.username, exc_info=exc)
+            raise HTTPException(status_code=503, detail=DEVICE_HARVEST_FAILED_DETAIL.format(kind=type(exc).__name__)) from exc
+        # `period` values are day counts; `0` (all time) is rejected at the schema.
+        records = device_records(feed.aweme_list, profile.user_id, limit=limit, max_age_days=int(req.period.value))
+        return UserPostsResponse(username=req.username, user_id=profile.user_id, sec_uid=profile.sec_uid, source=DEVICE_SOURCE, complete=not feed.has_more, period=req.period, keywords=[], cap_units=0, device=DEVICE_SOURCE, count=len(records), has_more=feed.has_more, page_token=None, elapsed_s=round(time.monotonic() - started, 2), results=records)
+
     @app.get('/health', response_model=HealthResponse, tags=['ops'])
     async def health(pool: ClientPool=Depends(get_pool)) -> HealthResponse:
         status = pool.status()
         status['status'] = 'ok' if status['device_count'] > 0 else 'no_devices'
         return HealthResponse(**status)
+
+    @app.get('/ops/events', response_model=EventsResponse, tags=['ops'])
+    async def ops_events(request: Request, after: int = Query(default=0, ge=0), limit: int = Query(default=EVENTS_DEFAULT_LIMIT, ge=1, le=EVENTS_MAX_LIMIT), kind: str | None = Query(default=None, max_length=64)) -> EventsResponse:
+        """The worker's JSONL event log, for `panel.html`. A missing file is empty, never a 500."""
+        path = _events_path(request)
+        events, last_seq, size = await asyncio.to_thread(read_events, path, after=after, limit=limit, kind_prefix=kind or None)
+        return EventsResponse(events=events, last_seq=last_seq, path=os.path.basename(path), size_bytes=size)
+
+    @app.get('/ops/events/summary', response_model=EventsSummaryResponse, tags=['ops'])
+    async def ops_events_summary(request: Request) -> EventsSummaryResponse:
+        path = _events_path(request)
+        tail = await asyncio.to_thread(read_tail, path, last_n=EVENTS_SUMMARY_WINDOW)
+        counts: dict[str, int] = {}
+        last_heartbeat_ts = None
+        for event in tail:
+            kind = str(event.get('kind', ''))
+            counts[kind] = counts.get(kind, 0) + 1
+            if kind == HEARTBEAT_KIND:
+                last_heartbeat_ts = event.get('ts')
+        last = tail[-1] if tail else {}
+        return EventsSummaryResponse(counts=counts, total=len(tail), last_heartbeat_ts=last_heartbeat_ts, last_event_ts=last.get('ts'), last_seq=int(last.get('seq') or 0), path=os.path.basename(path), size_bytes=events_file_size(path))
     return app
+
+
+def _events_path(request: Request) -> str:
+    """`events_path:` from the YAML (already anchored to the config dir), else the repo default."""
+    return request.app.state.config.events_path or default_events_path()

@@ -89,6 +89,10 @@ class ApiClient:
         self._session = requests.Session() if session is None else session
         self._timeout = (connect_timeout_s, read_timeout_s)
 
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
     def search(self, *, query: str, limit: int, sort_type: SortType | None = None, publish_time: PublishTime | None = None) -> dict[str, Any]:
         """`POST /search` for a keyword job."""
         body: dict[str, Any] = {'type': KEYWORD_SEARCH_TYPE, 'query': query, 'limit': limit}

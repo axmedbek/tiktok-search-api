@@ -68,6 +68,8 @@ from tiktoksearch.harvest_spool import FileSpool, SpoolEntry, write_entry  # noq
 
 USER_ID = '7195575867517944837'
 FAKE_BINARY = 'fake-waydroid'
+# What a page job asks for by default; larger than any one spooled page.
+WANT = 20
 # A value that would be a shell injection if anything on this path ever built a
 # command STRING. Nothing does; this is the case that proves it.
 SHELL_BAIT = '7195; rm -rf /'
@@ -113,10 +115,11 @@ class FakeSpool:
         self.log.append(('census', user_id))
         return self._names
 
-    def newest_since(self, user_id: str, *, after: float, exclude=()) -> SpoolEntry | None:
+    def entries_since(self, user_id: str, *, after: float, exclude=()) -> dict[str, SpoolEntry]:
         self.log.append(('poll', user_id))
         self.since_calls.append({'user_id': user_id, 'after': after, 'exclude': frozenset(exclude)})
-        return self._entries.pop(0) if self._entries else None
+        item = self._entries.pop(0) if self._entries else None
+        return {} if item is None else {f'fresh-{len(self.since_calls)}.json': item}
 
 
 def recorder(log=None, *, raises: BaseException | None = None):
@@ -136,7 +139,7 @@ def recorder(log=None, *, raises: BaseException | None = None):
 
 def config(tmp_path, **over) -> DeviceConfig:
     base = dict(spool_dir=str(tmp_path), waydroid_binary=FAKE_BINARY,
-                harvest_timeout_s=2.0, poll_interval_s=0.5, intent_timeout_s=1.0)
+                harvest_timeout_s=2.0, poll_interval_s=0.5, intent_timeout_s=1.0, settle_s=1.0)
     base.update(over)
     return DeviceConfig(**base)
 
@@ -229,7 +232,7 @@ class TestTheHappyVisit:
         spool = FakeSpool(entries=[entry(captured_at=1_000.0, ids=[1, 2, 3])])
         drv = DeviceDriver(config(tmp_path), spool=spool, run=run, clock=FakeClock(),
                            sleep=lambda _s: None, env={'X': '1'})
-        feed = drv.fetch_posts(USER_ID)
+        feed = drv.fetch_posts(USER_ID, want=3)
         assert isinstance(feed, DeviceFeed)
         assert len(feed.aweme_list) == 3
         assert feed.has_more is True
@@ -245,9 +248,9 @@ class TestTheHappyVisit:
         # a feed OBJECT comes back — "no records" alone would also be true of
         # the raise this must not be.
         spool = FakeSpool(entries=[entry(captured_at=1_000.0, body=feed_body([], has_more=False))])
-        drv = DeviceDriver(config(tmp_path), spool=spool, run=recorder(), clock=FakeClock(),
+        drv = DeviceDriver(config(tmp_path), spool=spool, run=recorder(), clock=FakeClock(step=0.5),
                            sleep=lambda _s: None)
-        feed = drv.fetch_posts(USER_ID)
+        feed = drv.fetch_posts(USER_ID, want=WANT)
         assert isinstance(feed, DeviceFeed) and feed.aweme_list == () and feed.has_more is False
 
     def test_the_user_id_is_validated_before_any_process_is_started(self, tmp_path):
@@ -255,7 +258,7 @@ class TestTheHappyVisit:
         drv = DeviceDriver(config(tmp_path), spool=FakeSpool(), run=run, clock=FakeClock(),
                            sleep=lambda _s: None)
         with pytest.raises(UnusableUserId):
-            drv.fetch_posts(SHELL_BAIT)
+            drv.fetch_posts(SHELL_BAIT, want=WANT)
         assert run.calls == [], 'nothing may be invoked with an unvalidated user_id'
 
 
@@ -269,7 +272,7 @@ class TestTheStaleEntryGuarantee:
         log: list = []
         spool = FakeSpool(names={'stale.json'}, entries=[entry(captured_at=1_000.0)], log=log)
         DeviceDriver(config(tmp_path), spool=spool, run=recorder(log), clock=FakeClock(),
-                     sleep=lambda _s: None).fetch_posts(USER_ID)
+                     sleep=lambda _s: None).fetch_posts(USER_ID, want=2)
         assert log[0] == ('census', USER_ID)
         assert log[1][0] == 'intent'
         assert log[2] == ('poll', USER_ID)
@@ -278,7 +281,7 @@ class TestTheStaleEntryGuarantee:
         names = {'a.json', 'b.json'}
         spool = FakeSpool(names=names, entries=[None, entry(captured_at=1_000.0)])
         DeviceDriver(config(tmp_path), spool=spool, run=recorder(), clock=FakeClock(step=0.1),
-                     sleep=lambda _s: None).fetch_posts(USER_ID)
+                     sleep=lambda _s: None).fetch_posts(USER_ID, want=2)
         assert spool.since_calls, 'the spool was never polled'
         assert all(call['exclude'] == frozenset(names) for call in spool.since_calls)
 
@@ -294,7 +297,7 @@ class TestTheStaleEntryGuarantee:
         clock = FakeClock(start=1_000.0, step=0.4)
         drv = DeviceDriver(config(tmp_path), run=recorder(), clock=clock, sleep=lambda _s: None)
         with pytest.raises(HarvestTimeout):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
         # The second instrument would have waved it through: the entry is
         # there, is readable, and is newer than the visit.
         assert FileSpool(str(tmp_path)).newest_since(USER_ID, after=1_000.0) is not None
@@ -310,7 +313,7 @@ class TestTheStaleEntryGuarantee:
 
         drv = DeviceDriver(config(tmp_path), run=_run, clock=FakeClock(start=1_000.0, step=0.1),
                            sleep=lambda _s: None)
-        feed = drv.fetch_posts(USER_ID)
+        feed = drv.fetch_posts(USER_ID, want=2)
         assert [a['aweme_id'] for a in feed.aweme_list] == [str(i) for i in fresh]
 
     def test_an_entry_that_lands_between_the_census_and_the_intent_is_rejected(self, tmp_path):
@@ -324,7 +327,7 @@ class TestTheStaleEntryGuarantee:
         drv = DeviceDriver(config(tmp_path), run=_run, clock=FakeClock(start=1_000.0, step=0.4),
                            sleep=lambda _s: None)
         with pytest.raises(HarvestTimeout):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
 
     def test_another_accounts_entry_is_not_this_visits_answer(self, tmp_path):
         other = SpoolEntry.from_response(user_id='7195575867517944838', captured_at=1_000.5,
@@ -333,7 +336,7 @@ class TestTheStaleEntryGuarantee:
         drv = DeviceDriver(config(tmp_path), run=recorder(), clock=FakeClock(start=1_000.0, step=0.4),
                            sleep=lambda _s: None)
         with pytest.raises(HarvestTimeout):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
 
 
 class TestTheBoundedWait:
@@ -344,7 +347,7 @@ class TestTheBoundedWait:
         drv = DeviceDriver(config(tmp_path), spool=FakeSpool(), run=recorder(),
                            clock=FakeClock(start=1_000.0, step=0.4), sleep=lambda _s: None)
         with pytest.raises(HarvestTimeout):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
 
     def test_a_timeout_is_transient_so_the_job_requeues(self):
         assert issubclass(HarvestTimeout, DeviceError)
@@ -355,7 +358,7 @@ class TestTheBoundedWait:
                            spool=FakeSpool(), run=recorder(),
                            clock=FakeClock(start=1_000.0, step=0.5), sleep=slept.append)
         with pytest.raises(HarvestTimeout):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
         assert slept, 'the loop never yielded'
         assert all(0 <= value <= 0.5 for value in slept), slept
 
@@ -369,7 +372,7 @@ class TestTheBoundedWait:
         drv = DeviceDriver(config(tmp_path, harvest_timeout_s=2.0, poll_interval_s=0.5),
                            spool=spool, run=recorder(), clock=clock, sleep=lambda _s: None)
         with pytest.raises(HarvestTimeout):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
         assert len(spool.since_calls) == _poll_ceiling(2.0, 0.5)
 
     def test_the_poll_ceiling_never_fires_before_the_deadline_on_a_sane_clock(self):
@@ -381,7 +384,7 @@ class TestTheBoundedWait:
         spool = FakeSpool(entries=[None, None, entry(captured_at=1_000.0)])
         drv = DeviceDriver(config(tmp_path), spool=spool, run=recorder(),
                            clock=FakeClock(start=1_000.0, step=0.1), sleep=lambda _s: None)
-        assert len(drv.fetch_posts(USER_ID).aweme_list) == 2
+        assert len(drv.fetch_posts(USER_ID, want=2).aweme_list) == 2
         assert len(spool.since_calls) == 3
 
 
@@ -394,19 +397,19 @@ class TestAnUnreadableResponse:
                                       b'{"status_code": 0, "has_more": 0}'])
     def test_it_raises_unreadable_and_not_a_timeout(self, tmp_path, body):
         spool = FakeSpool(entries=[entry(captured_at=1_000.0, body=body)])
-        drv = DeviceDriver(config(tmp_path), spool=spool, run=recorder(), clock=FakeClock(),
+        drv = DeviceDriver(config(tmp_path), spool=spool, run=recorder(), clock=FakeClock(step=0.5),
                            sleep=lambda _s: None)
         with pytest.raises(UnreadableResponse):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
 
     def test_the_zero_byte_shape_is_not_reported_as_an_empty_feed(self, tmp_path):
         # HTTP 200, 0 bytes, `tt_orcas_res: 1` — the measured rejection shape.
         # `.claude/rules/anti-block.md`: never an empty success.
         spool = FakeSpool(entries=[entry(captured_at=1_000.0, body=b'')])
-        drv = DeviceDriver(config(tmp_path), spool=spool, run=recorder(), clock=FakeClock(),
+        drv = DeviceDriver(config(tmp_path), spool=spool, run=recorder(), clock=FakeClock(step=0.5),
                            sleep=lambda _s: None)
         with pytest.raises(UnreadableResponse):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
 
     def test_it_is_transient(self):
         assert issubclass(UnreadableResponse, DeviceError)
@@ -471,7 +474,7 @@ class TestRunIntent:
                            run=recorder(raises=IntentFailed('container down')),
                            clock=FakeClock(), sleep=lambda _s: None)
         with pytest.raises(IntentFailed):
-            drv.fetch_posts(USER_ID)
+            drv.fetch_posts(USER_ID, want=WANT)
 
     def test_it_is_transient(self):
         assert issubclass(IntentFailed, DeviceError)

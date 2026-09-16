@@ -65,6 +65,11 @@ NIL_FEDERATION_EMPTY = 'federation_empty'
 # SoftError (502) — anti-block invariants (a) and (b). Adding a value here is
 # a deliberate decision to stop counting that shape against identity health.
 _TAIL_NILS: frozenset[str] = frozenset((NIL_EMPTY_SESSION, NIL_FEDERATION_EMPTY))
+# `search_nil_item` for "this device has searched too much" — a per-device
+# RATE limit that lifts on its own after minutes (measured ~6 min after >1000
+# signed searches in ~2 h). Still risk-control (SoftError, identity penalty),
+# but NOT retried: every retry is a fresh signed search, which feeds the limit.
+HIT_LIMIT_NIL = 'hit_limit'
 # TikTok `status_code` values that mean "there is no such user". UNVERIFIED in
 # this repo — no capture here carries one — so this is deliberately a single
 # named constant that one live check can correct, rather than a literal buried
@@ -480,7 +485,7 @@ class TikTokClient:
         progress = PageProgress(cursor=state.cursor, search_id=state.search_id)
         try:
             end = self._paginate_into(out=out, seen=seen, path=path, build_params=build, items_key=items_key, unwrap=unwrap, flatten=flatten_video, source_term=query.source_term, limit=query.limit, start_cursor=state.cursor, search_id=state.search_id, progress=progress)
-        except (SoftError, TransportError) as exc:
+        except (RateLimited, SoftError, TransportError) as exc:
             if progress.started:
                 logger.warning('endpoint %s failed after serving records (kept %d, still resumable at cursor %d): %s', path, len(out), progress.cursor, exc)
                 return (progress.resume_state(path), exc)
@@ -1095,6 +1100,14 @@ class TikTokClient:
                     reason = nil if nil else shape.empty_reason
                     last_err = SoftError(f'empty {shape.name} result ({reason})')
                     logger.warning('empty result (attempt %d, device=%s, path=%s): %s', attempt, self.device_id, path, reason)
+                    if nil == HIT_LIMIT_NIL:
+                        # A per-device search RATE limit, not identity distrust:
+                        # measured 2026-09-14, it lifts by itself within minutes
+                        # while the same identity keeps resolving profiles. Raised
+                        # as `RateLimited` so `pool.run`'s `except SoftError` does
+                        # NOT count it toward `stale` — three of these retired the
+                        # only identity and 503'd the page jobs that never search.
+                        raise RateLimited(f'empty {shape.name} result ({reason})')
                     time.sleep(0.5 * (attempt + 1))
                     continue
             return data

@@ -66,16 +66,23 @@ from tiktoksearch.broker.device_source import (  # noqa: E402
 from tiktoksearch.broker.envelope import body  # noqa: E402
 from tiktoksearch.broker.errors import MalformedMessage  # noqa: E402
 from tiktoksearch.broker.messages import PageMessage  # noqa: E402
-from tiktoksearch.device.driver import DeviceConfig, DeviceFeed  # noqa: E402
+from tiktoksearch.api.schemas import ProfileResponse  # noqa: E402
+from tiktoksearch.device.driver import DeviceConfig, DeviceFeed, DeviceProfile  # noqa: E402
 from tiktoksearch.device.errors import (  # noqa: E402
     HarvestTimeout,
     IntentFailed,
+    ProfileUnavailable,
     UnreadableResponse,
     UnusableUserId,
 )
 from tiktoksearch.mapping import flatten_video  # noqa: E402
 
 USER_ID = PROFILE_PAYLOAD['user_id']
+# What the device's own profile reply resolved the handle to.
+DEVICE_PROFILE = DeviceProfile(user_id=USER_ID, sec_uid='MS4wLjABAAAA-sec', username=HANDLE, nickname='Sirab',
+                               avatar_url='https://p16.tiktokcdn.com/a.jpeg', follower_count=10, following_count=2,
+                               aweme_count=3, heart_count=40, signature=None, verified=False, private=False,
+                               region_code='AZ', captured_at=999.0)
 JOB = PageMessage(page_id=1, page_name=HANDLE, page_url=f'https://www.tiktok.com/@{HANDLE}', max_posts=50)
 
 
@@ -94,17 +101,17 @@ def feed(awemes, *, has_more: bool = True, max_cursor: int | None = 1_756_628_30
 
 
 class FakeDriver:
-    """The device boundary. Answers with a feed or raises — never a process."""
+    """The device boundary. Answers with (profile, feed) or raises — never a process."""
 
     def __init__(self, answer) -> None:
         self._answer = answer
         self.calls: list[str] = []
 
-    def fetch_posts(self, user_id: str):
-        self.calls.append(user_id)
+    def visit_handle(self, handle: str, *, want: int):
+        self.calls.append(handle)
         if isinstance(self._answer, BaseException):
             raise self._answer
-        return self._answer
+        return DEVICE_PROFILE, self._answer
 
 
 def run_consumer(deliveries, api: FakeApi, *, page_source=None, config: ConsumerConfig | None = None):
@@ -207,28 +214,29 @@ class TestPageOnlyRouting:
 
 
 class TestTheResolve:
-    """A deep link addresses an account by numeric uid and a page job carries a
-    handle. `POST /profile` already resolves that and costs one cap unit, so it
-    is used rather than a second resolver being written."""
+    """The DEVICE resolves the handle (`visit_handle` opens the profile's web
+    URL; the app calls the profile endpoint the spool captures). `POST /profile`
+    is a user search that never surfaces auto-generated handles and spends
+    search quota, so it is no longer called on this path."""
 
-    def test_the_profile_endpoint_is_the_resolver_and_is_called_once(self):
+    def test_the_device_is_the_resolver_and_the_api_is_not_called(self):
         page_source, api, driver = source(feed([aweme('1')]))
         page_source(JOB)
-        assert api.calls == [('profile', {'username': HANDLE})]
-        assert driver.calls == [USER_ID], 'the driver is handed the resolved uid'
+        assert api.calls == [], 'no local-API call: the device resolves the handle'
+        assert driver.calls == [HANDLE], 'the driver is handed the handle'
 
     def test_user_posts_is_never_called_on_this_path(self):
         page_source, api, _driver = source(feed([aweme('1')]))
         page_source(JOB)
         assert 'user_posts' not in api.names
 
-    def test_a_profile_with_no_user_id_is_transient_not_a_dropped_job(self):
-        # Our OWN API answering off its declared contract — classified the way
-        # `api_client.results` classifies a response with no `results` list.
-        page_source, _api, _driver = source(feed([]), profile={'username': HANDLE})
+    def test_an_unavailable_profile_is_permanent_so_the_job_is_dropped(self):
+        # TikTok said the account is not there — a redelivery cannot make a
+        # deleted user exist, so this is acked and dropped like a 404 was.
+        page_source, _api, _driver = source(ProfileUnavailable('no such user', status_code=2065))
         with pytest.raises(ApiCallError) as caught:
             page_source(JOB)
-        assert caught.value.failure is Failure.TRANSIENT
+        assert caught.value.failure is Failure.PERMANENT
 
     def test_a_page_url_that_is_not_a_tiktok_profile_is_still_a_malformed_message(self):
         # The existing acked-and-dropped path, unchanged.
@@ -393,7 +401,11 @@ class TestTheEnvelopeShapeIsUnchanged:
 
         assert set(device_wire) == set(search_wire)
         assert set(device_wire['metadata']) == set(search_wire['metadata'])
-        assert set(device_wire['metadata']['profile']) == set(search_wire['metadata']['profile'])
+        # The profile carries EVERY key `POST /profile` answers with (minus our
+        # `device`/`elapsed_s` diagnostics, plus the envelope's `profile_url`).
+        contract = set(ProfileResponse.model_fields) - {'device', 'elapsed_s'} | {'profile_url'}
+        assert set(device_wire['metadata']['profile']) == contract
+        assert device_wire['metadata']['profile']['source'] == 'device'
 
     def test_search_type_is_page_because_the_queue_is_what_it_names(self):
         page_source, _api, _driver = source(feed([aweme('1')]))

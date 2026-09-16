@@ -26,7 +26,9 @@ What is pinned, in the order the plan's ack table lists it:
 |---|---|
 | every post message published | ack |
 | permanent (404 / 422 / malformed body) | ack |
-| transient (502 / 503 / unreachable / publish failure) | nack(requeue=True) + SHORT backoff |
+| transient (504 / unreachable / publish failure) | nack(requeue=True) + SHORT backoff |
+| 502 hit_shark/hit_limit, 503 no usable identity | nack(requeue=True) + MEDIUM backoff |
+| 503 no usable warm identity | nack(requeue=True) + MEDIUM backoff |
 | 429 daily cap exhausted | nack(requeue=True) + LONG backoff |
 | 429 TikTok rate-limited | nack(requeue=True) + SHORT backoff |
 
@@ -474,7 +476,7 @@ class TestPermanentErrorsAck:
 
 
 class TestTransientErrorsNackWithRequeue:
-    @pytest.mark.parametrize('message', ['/search 502', '/search 503', '/search unreachable (ConnectionError)'])
+    @pytest.mark.parametrize('message', ['/search 504', '/search 503', '/search unreachable (ConnectionError)'])
     def test_a_transient_failure_is_requeued(self, message):
         api = FakeApi(search=ApiCallError(Failure.TRANSIENT, message))
         _, channel, _ = keyword_run(api)
@@ -482,7 +484,9 @@ class TestTransientErrorsNackWithRequeue:
         assert channel.acked == []
 
     def test_a_transient_failure_takes_the_short_backoff(self):
-        api = FakeApi(search=ApiCallError(Failure.TRANSIENT, '/search 503', status=503))
+        # 504, not 502/503: a 502 (hit_shark / hit_limit) and a 503 ("all warm identities are stale") take the
+        # MEDIUM backoff, because the identity cooldown is minutes long.
+        api = FakeApi(search=ApiCallError(Failure.TRANSIENT, '/search 504', status=504))
         _, _, connection = keyword_run(api)
         assert connection.sleeps == [SHORT]
 
@@ -490,7 +494,7 @@ class TestTransientErrorsNackWithRequeue:
         # While the message is unacked the broker cannot redeliver it, so the
         # wait is actually observed. Nack first and, at prefetch 1, the same
         # message comes straight back and the wait protects nothing.
-        api = FakeApi(search=ApiCallError(Failure.TRANSIENT, '/search 503', status=503))
+        api = FakeApi(search=ApiCallError(Failure.TRANSIENT, '/search 504', status=504))
         _, channel, _ = keyword_run(api)
         assert channel.events == [('sleep', SHORT), ('nack', 1, True)]
 
@@ -511,10 +515,12 @@ class TestTheTwo429sTakeDifferentBackoffs:
         assert connection.sleeps == [LONG]
         assert channel.nacked == [(1, True)]
 
-    def test_a_rate_limit_takes_the_short_backoff(self):
+    def test_a_rate_limit_takes_the_medium_backoff(self):
+        # A TikTok rate limit (`hit_limit`) lifts with time, so retrying in
+        # seconds only burns signed requests: MEDIUM, not SHORT.
         api = FakeApi(search=ApiCallError(Failure.TRANSIENT, '/search 429 rate-limited', status=429))
         _, channel, connection = keyword_run(api)
-        assert connection.sleeps == [SHORT]
+        assert connection.sleeps == [BACKOFFS.medium_backoff_s]
         assert channel.nacked == [(1, True)]
 
     def test_the_two_backoffs_are_not_the_same_knob(self):

@@ -79,6 +79,9 @@ SEC_UID_PATTERN = r'^[A-Za-z0-9_-]+$'
 # server that reached the real upstream endpoints.
 PROFILE_SOURCE = 'user_search'
 POSTS_SOURCE = 'search'
+# `/user/posts` served by the genuine app's own post feed on a device (the
+# `device_posts:` config knob).
+DEVICE_SOURCE = 'device'
 # `/user/posts` never returns an account's full post history on this path — see
 # `UserPostsResponse.complete`.
 POSTS_COMPLETE = False
@@ -176,8 +179,8 @@ class UserPostsResponse(BaseModel):
     # omitted from OpenAPI's `required` list, and a generated client would then
     # type it optional-and-possibly-missing — exactly the doc-footnote status
     # these two fields exist to avoid. The handler passes both explicitly.
-    source: str = Field(description="Where these posts came from, machine-readably. `search` means they are the videos KEYWORD SEARCH surfaces for this handle, filtered down to the ones this account authored — not a read of the account's post feed. Treat any other value as a different (better) source.")
-    complete: bool = Field(description="Whether this is the account's full post history. **Always false on the `search` source**, now for three independent reasons: the set is only what keyword search SURFACES (posts the account really has may never appear); it is bounded to `period`, so older posts are excluded BY DESIGN; and TikTok's index is not deterministic — the same keyword in the same window measured 17 records on one call and 14 on another. Coverage, not completeness, is what the multi-keyword union buys (see `keywords`). Yield tracks how visible the account is in search, so a low-visibility account can legitimately return few results or none. COMPLETENESS only: `results` is ordered newest-first (see `results`), so a short page is still a correctly ordered one.")
+    source: str = Field(description="Where these posts came from, machine-readably. `search` means they are the videos KEYWORD SEARCH surfaces for this handle, filtered down to the ones this account authored — not a read of the account's post feed. Treat any other value as a different (better) source. `device` means the account's own post feed, read from the genuine app on a device.")
+    complete: bool = Field(description="Whether this is the account's full post history. **Always false on the `search` source**, now for three independent reasons: the set is only what keyword search SURFACES (posts the account really has may never appear); it is bounded to `period`, so older posts are excluded BY DESIGN; and TikTok's index is not deterministic — the same keyword in the same window measured 17 records on one call and 14 on another. Coverage, not completeness, is what the multi-keyword union buys (see `keywords`). Yield tracks how visible the account is in search, so a low-visibility account can legitimately return few results or none. COMPLETENESS only: `results` is ordered newest-first (see `results`), so a short page is still a correctly ordered one. On the `device` source it is true exactly when the feed reported no more pages.")
     period: PublishTime = Field(description='The recency window that was searched, echoed back. Every record in `results` is from within it, so a caller can state the range it is looking at without inferring it from the records.')
     keywords: list[str] = Field(description="The keywords that were actually searched, in the order they were spent, so a caller can see WHY it got what it got. Always starts with the handle; the account's `display_name` follows when it adds something (it is omitted when absent, or equal to the handle case-insensitively). Each entry is one search, one `cap_units` unit, and its own `source_term` on the records it surfaced. Measured live on `@bakuesaz` in the default window: `bakuesaz` alone surfaced 14 of the returned posts and `BAKU ES` (its display name) another 10, for 24 across 16 distinct days — the second keyword is a real coverage gain, not a spelling variant. Nothing here is guessed from how the handle might split into words.")
     cap_units: int = Field(description='What this request COST against the per-device daily cap. The cap is charged per pooled call, not per signed request, so this is one unit per entry in `keywords` plus one for the display-name resolve — i.e. `len(keywords) + 1` on a first page, and exactly `1` on a `page_token` continuation, which skips the resolve and searches the handle alone. Stated rather than hidden: the caller is paying for coverage and must be able to see the price. Each of those calls may itself spend several signed requests across the two merged video endpoints — that is the pre-existing `/search` cost model and is NOT charged again against the cap.')
@@ -187,3 +190,28 @@ class UserPostsResponse(BaseModel):
     page_token: Optional[str] = Field(default=None, description='Pass this back as `page_token` for the next page. Null when there is nothing more to fetch **and also whenever more than one keyword was searched**: a page merged from several queries has no single search session to resume, so no token is minted rather than one that would resume a different query than it was minted for. A single-keyword page (no usable display name) still gets one.')
     elapsed_s: float
     results: list[dict[str, Any]] = Field(description="Video records in the IDENTICAL shape `/search` returns (`flatten_video`), so a client renders them with the same code. De-duplicated by record `id` across the searched keywords, and each record's `source_term` names the keyword that surfaced it. **Ordered newest first by `create_time`** — records whose `create_time` is null (unknown upstream) come LAST, since an undated post cannot be truthfully placed among dated ones. The order is stable, so identical requests return identical orderings. **This orders the PAGE, not the paginated STREAM:** pages still arrive in search-relevance order, so page 2 can contain videos both older AND newer than page 1. Read one page and you get a correctly ordered page; paginate and you must ACCUMULATE and RE-SORT across pages yourself.")
+
+
+# --- operator events (`GET /ops/events`) -----------------------------------
+EVENTS_DEFAULT_LIMIT = 200
+EVENTS_MAX_LIMIT = 500
+# How many trailing events `/ops/events/summary` counts over.
+EVENTS_SUMMARY_WINDOW = 5000
+HEARTBEAT_KIND = 'worker.heartbeat'
+
+
+class EventsResponse(BaseModel):
+    events: list[dict[str, Any]] = Field(description='Worker events with `seq > after`, in file order, at most `limit`.')
+    last_seq: int = Field(description='Pass back as `after` to poll for what follows.')
+    path: str = Field(description='File NAME of the event log (never the directory).')
+    size_bytes: int
+
+
+class EventsSummaryResponse(BaseModel):
+    counts: dict[str, int] = Field(description=f'Events per `kind` over the last {EVENTS_SUMMARY_WINDOW} events.')
+    total: int
+    last_heartbeat_ts: Optional[str] = None
+    last_event_ts: Optional[str] = None
+    last_seq: int
+    path: str
+    size_bytes: int

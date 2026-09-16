@@ -9,8 +9,8 @@ those. The device path issues no signed request at all — it opens a profile in
 the app and reads what mitmproxy spooled — so it cannot be rate-limited, cannot
 be shadow-banned, and has no HTTP mapping.
 
-**Every one of these classifies TRANSIENT**, and that is the whole reason they
-share a base class: `broker/device_source.py` maps `DeviceError` onto the
+**These classify TRANSIENT except for confirmed `ProfileUnavailable`**:
+`broker/device_source.py` maps other `DeviceError` failures onto the
 EXISTING ack policy's `Failure.TRANSIENT` in one place, so the broker's ack
 table stays the single policy (`.claude/rules/learned-lessons.md` — one policy,
 not two). A Waydroid container that is down, a session that is not on screen,
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 
 class DeviceError(Exception):
-    """Any failure of the device harvest path. Always transient.
+    """Any failure of the device harvest path; transient unless explicitly classified.
 
     Its message text is always built from our own literals plus non-secret
     values (a public `user_id`, a timeout, a binary name, an exit code). No
@@ -72,3 +72,29 @@ class UnusableUserId(DeviceError):
     because inventing a second ack outcome for a condition that cannot occur
     would be a policy nobody ever exercises.
     """
+
+
+class UnusableHandle(DeviceError):
+    """The handle handed to `visit_handle` fails `limits.USERNAME_PATTERN`.
+
+    Cannot fire on the live paths — `broker/handle.py` and `api/schemas.py`
+    validate with the same pattern first — so it is a `DeviceError` for the
+    reason `UnusableUserId` is.
+    """
+
+
+class ProfileUnavailable(DeviceError):
+    """TikTok explicitly rejected the requested profile handle.
+
+    The handle resolver returned the measured invalid-handle code 8196.
+    Unknown errors and missing profile fields do not establish absence and
+    remain transient. This is the ONE device error that is NOT
+    transient: `broker/device_source.py` maps it to `Failure.PERMANENT` and
+    `api/app.py` to 404, exactly like `errors.NotFound` on the signed path.
+    Carries TikTok's own `status_code`/`status_msg` (no secret in either).
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, status_msg: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.status_msg = status_msg

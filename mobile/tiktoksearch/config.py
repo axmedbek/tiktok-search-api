@@ -188,6 +188,71 @@ class ClientConfig:
             overrides['api_hosts'] = tuple(overrides['api_hosts'])
         return replace(self, **overrides)
 
+# The top-level YAML key that configures the device-backed `/user/posts` source.
+DEVICE_POSTS_KEY = 'device_posts'
+EVENTS_PATH_KEY = 'events_path'
+
+
+def _resolve_optional_path(raw: Any, base_dir: str | None) -> str | None:
+    """A YAML path value: blank -> None; relative -> anchored to `base_dir`."""
+    if raw is None or not str(raw).strip():
+        return None
+    path = str(raw).strip()
+    if base_dir and not os.path.isabs(path):
+        return os.path.normpath(os.path.join(base_dir, path))
+    return path
+# Timing knobs of `DeviceSourceConfig`, coerced to float and required positive
+# at the YAML boundary so a `0` cannot become a busy poll loop.
+_DEVICE_TIMING_FIELDS: tuple[str, ...] = ('harvest_timeout_s', 'settle_s', 'poll_interval_s')
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceSourceConfig:
+    """`POST /user/posts` served by the genuine app on an adb-reachable device.
+
+    Disabled by default, so every profile that does not mention `device_posts:`
+    keeps the keyword-search interim path. `spool_dir` None defers to
+    `harvest_spool.default_spool_dir()` where the driver is built; a relative
+    value is resolved against the config file's directory by `load_yaml`, the
+    same rule `identities_path` follows."""
+
+    enabled: bool = False
+    adb_binary: str = 'adb'
+    adb_serial: str | None = None
+    app_package: str = 'com.zhiliaoapp.musically'
+    spool_dir: str | None = None
+    harvest_timeout_s: float = 45.0
+    settle_s: float = 6.0
+    poll_interval_s: float = 0.5
+
+    def __post_init__(self) -> None:
+        for name in _DEVICE_TIMING_FIELDS:
+            if getattr(self, name) <= 0:
+                raise ValueError(f'{DEVICE_POSTS_KEY}.{name} must be greater than 0')
+
+    @classmethod
+    def from_mapping(cls, cfg: Mapping[str, Any] | None, *, base_dir: str | None = None) -> 'DeviceSourceConfig':
+        cfg = cfg or {}
+        known = frozenset((f.name for f in fields(cls)))
+        data: dict[str, Any] = {k: v for k, v in cfg.items() if k in known and v is not None}
+        if 'enabled' in data:
+            data['enabled'] = bool(data['enabled'])
+        for name in _DEVICE_TIMING_FIELDS:
+            if name in data:
+                data[name] = float(data[name])
+        for name in ('adb_binary', 'adb_serial', 'app_package', 'spool_dir'):
+            # A blank string is "unset": the required strings fall back to
+            # their defaults, the optional ones become None.
+            if name in data and not str(data[name]).strip():
+                del data[name]
+            elif name in data:
+                data[name] = str(data[name]).strip()
+        spool_dir = data.get('spool_dir')
+        if spool_dir and base_dir and not os.path.isabs(spool_dir):
+            data['spool_dir'] = os.path.normpath(os.path.join(base_dir, spool_dir))
+        return cls(**data)
+
+
 @dataclass(frozen=True, slots=True)
 class PoolConfig:
     daily_request_cap_per_device: int = 300
@@ -198,14 +263,25 @@ class PoolConfig:
     devices: tuple[Mapping[str, Any], ...] = ()
     synthetic_devices: int = 0
     client_defaults: ClientConfig = field(default_factory=ClientConfig)
+    device_posts: DeviceSourceConfig = field(default_factory=DeviceSourceConfig)
+    # The worker's JSONL event log `GET /ops/events` reads. None defers to
+    # `broker.events.default_events_path()`; a relative value is resolved
+    # against the config file's directory, the same rule `identities_path` follows.
+    events_path: str | None = None
+    # Seconds a stale warm identity sits out before `IdentityStore` retries it
+    # (`identity_manager.DEFAULT_STALE_COOLDOWN_S`).
+    stale_cooldown_s: float = 600.0
 
     @classmethod
-    def from_mapping(cls, cfg: Mapping[str, Any]) -> 'PoolConfig':
-        return cls(daily_request_cap_per_device=int(cfg.get('daily_request_cap_per_device', 300)), acquire_timeout_s=float(cfg.get('acquire_timeout_s', 60)), max_results_per_search=int(cfg.get('max_results_per_search', 60)), default_fan_out=int(cfg.get('default_fan_out', 1)), proxies=tuple((p for p in cfg.get('proxies') or [] if p)), devices=tuple(cfg.get('devices') or ()), synthetic_devices=int(cfg.get('synthetic_devices', 0)), client_defaults=ClientConfig.from_mapping(cfg))
+    def from_mapping(cls, cfg: Mapping[str, Any], *, base_dir: str | None = None) -> 'PoolConfig':
+        return cls(daily_request_cap_per_device=int(cfg.get('daily_request_cap_per_device', 300)), acquire_timeout_s=float(cfg.get('acquire_timeout_s', 60)), stale_cooldown_s=float(cfg.get('stale_cooldown_s', 600)), max_results_per_search=int(cfg.get('max_results_per_search', 60)), default_fan_out=int(cfg.get('default_fan_out', 1)), proxies=tuple((p for p in cfg.get('proxies') or [] if p)), devices=tuple(cfg.get('devices') or ()), synthetic_devices=int(cfg.get('synthetic_devices', 0)), client_defaults=ClientConfig.from_mapping(cfg), device_posts=DeviceSourceConfig.from_mapping(cfg.get(DEVICE_POSTS_KEY), base_dir=base_dir), events_path=_resolve_optional_path(cfg.get(EVENTS_PATH_KEY), base_dir))
 
     @classmethod
     def load_yaml(cls, path: str | os.PathLike[str]) -> 'PoolConfig':
         if not os.path.exists(path):
             return cls()
         with open(path, 'r', encoding='utf-8') as f:
-            return cls.from_mapping(yaml.safe_load(f) or {})
+            raw = yaml.safe_load(f) or {}
+        # A relative `device_posts.spool_dir` is anchored to the CONFIG's
+        # directory, never the process cwd (`.claude/rules/learned-lessons.md`).
+        return cls.from_mapping(raw, base_dir=os.path.dirname(os.path.abspath(path)))

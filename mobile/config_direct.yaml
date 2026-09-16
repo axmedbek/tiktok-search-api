@@ -105,3 +105,8 @@ proxies:
   # - http://user123:pass456@proxy.example.com:8080
   # - socks5://user123:pass456@proxy.example.com:1080
   []
+device_posts:
+  enabled: true
+  adb_binary: C:/LDPlayer/LDPlayer14/adb.exe
+  adb_serial: 127.0.0.1:5555
+  spool_dir: ../data/capture/posts
