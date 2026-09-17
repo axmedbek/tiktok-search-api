@@ -273,7 +273,7 @@ class TestFailureClassification:
         assert connection.sleeps == []
         assert len(channel.published) == 1
         copy = channel.published[0]
-        assert copy['routing_key'] == PAGE_QUEUE and copy['exchange'] == ''
+        assert copy['routing_key'] == PAGE_QUEUE and copy['exchange'] == SETTINGS.exchange
         assert copy['body'] == page_body()
 
     def test_a_timeout_never_publishes_a_result(self):

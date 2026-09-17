@@ -309,7 +309,10 @@ class BrokerConsumer:
             # whole page queue for 10 minutes. Re-publish it at the TAIL instead and move on; the
             # job is acked only after the broker confirmed the copy.
             properties = pika.BasicProperties(content_type=RESULT_CONTENT_TYPE, delivery_mode=DELIVERY_MODE_PERSISTENT)
-            channel.basic_publish(exchange='', routing_key=queue, body=body, properties=properties, mandatory=True)
+            # Through the job exchange, not `amq.default`: the worker's broker user has no write access
+            # to the default exchange (403 ACCESS_REFUSED, measured), and the job queues are bound to
+            # the direct exchange under their own names.
+            channel.basic_publish(exchange=self._settings.exchange, routing_key=queue, body=body, properties=properties, mandatory=True)
             channel.basic_ack(delivery_tag=tag)
             logger.warning('transient device failure on %s, re-queued at the tail: %s', label, exc)
             self._emit('job.requeued', queue=queue, label=label, reason=str(exc), retry_in_s=0, to_tail=True)
