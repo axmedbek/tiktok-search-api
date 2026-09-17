@@ -163,7 +163,10 @@ NO_MORE_VIDEOS_MSG = 'No more videos'
 
 STATUS_ERROR = 'error'
 STATUS_UNAVAILABLE = 'unavailable'
-PROFILE_STATUSES = (STATUS_OK, STATUS_ERROR, STATUS_UNAVAILABLE)
+# A 0-byte resolver reply (`tt_orcas_res: 1`, measured 2026-09-17 once the account hit TikTok's
+# daily search cap): risk control refused the device, nothing about the handle is known.
+STATUS_THROTTLED = 'throttled'
+PROFILE_STATUSES = (STATUS_OK, STATUS_ERROR, STATUS_UNAVAILABLE, STATUS_THROTTLED)
 # Measured 2026-09-16: the resolver answered 8196, "Unique ID is invalid",
 # for a profile intent that otherwise timed out and blocked the page queue.
 INVALID_UNIQUE_ID_CODE = 8196
@@ -516,6 +519,11 @@ class ProfileEntry:
         """Whether the resolver explicitly rejected this requested handle."""
         return self.status == STATUS_UNAVAILABLE and self.status_code == INVALID_UNIQUE_ID_CODE
 
+    @property
+    def is_throttled(self) -> bool:
+        """Whether risk control refused the resolver for this device (0-byte reply)."""
+        return self.status == STATUS_THROTTLED
+
     @classmethod
     def from_resolver_response(cls, *, url: str, captured_at: float,
                                body: bytes | None) -> 'ProfileEntry | None':
@@ -525,6 +533,12 @@ class ProfileEntry:
         no user object. Only the measured rejection code proves absence;
         malformed or unfamiliar replies remain ordinary, retryable errors.
         """
+        if body == b'':
+            handle = _param_from_url(url, UNIQUE_ID_PARAM).strip().lower()
+            return cls(handle=handle, captured_at=float(captured_at), status=STATUS_THROTTLED, status_code=None,
+                       status_msg=None, user_id=None, sec_uid=None, username=None, nickname=None, avatar_url=None,
+                       follower_count=None, following_count=None, aweme_count=None, heart_count=None,
+                       signature=None, verified=False, private=False, region_code=None)
         payload = _json_object(body)
         raw_code = payload.get(FIELD_STATUS_CODE)
         # Do not truncate a malformed float or coerce bool into a status code.

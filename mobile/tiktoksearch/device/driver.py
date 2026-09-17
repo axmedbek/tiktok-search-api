@@ -85,7 +85,7 @@ from typing import Any, Callable, Collection, Mapping, Sequence
 
 from ..harvest_spool import FileSpool, ProfileEntry, ProfileSpool, SpoolEntry
 from ..limits import MAX_USERNAME_CHARS, USERNAME_PATTERN
-from .errors import (DeviceError, HarvestTimeout, IntentFailed, ProfileUnavailable, UnreadableResponse,
+from .errors import (DeviceError, DeviceThrottled, HarvestTimeout, IntentFailed, ProfileUnavailable, UnreadableResponse,
                      UnusableHandle, UnusableUserId)
 
 logger = logging.getLogger('tiktoksearch.device.driver')
@@ -512,6 +512,9 @@ class DeviceDriver:
                     name, self._config.intent_backend, len(known_profiles), len(known_posts), want)
         self._run(intent_argv_for_uri(self._config, handle_url(name)), self._env, self._config.intent_timeout_s)
         entry = self._await_profile(name, fired_at=fired_at, known=known_profiles)
+        if entry.is_throttled:
+            logger.warning('resolver refused by risk control for handle=%s (0-byte reply): device throttled', name)
+            raise DeviceThrottled(f'TikTok refused the handle resolver for {name} (risk control)')
         if entry.is_unavailable:
             logger.warning('profile for handle=%s unavailable (status_code=%s)', name, entry.status_code)
             raise ProfileUnavailable(f'TikTok has no profile for handle {name} (status_code={entry.status_code})',

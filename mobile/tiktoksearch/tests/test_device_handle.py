@@ -112,7 +112,7 @@ def test_resolver_not_found_finishes_without_waiting_for_a_profile(tmp_path):
 
 @pytest.mark.parametrize('body', [
     b'{"status_code":9999,"status_msg":"try again later"}',
-    b'{"unexpected":"shape"}', b'not-json', b'', None,
+    b'{"unexpected":"shape"}', b'not-json', None,
 ])
 def test_unknown_or_malformed_resolver_reply_is_transient(tmp_path, body):
     clock = Clock()

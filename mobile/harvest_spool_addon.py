@@ -43,6 +43,7 @@ nobody wants in a diff.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -141,7 +142,18 @@ class HarvestSpool:
         # response must remain the source of account fields and feed ownership.
         if entry is None:
             raw = _body(response) or b''
-            if not raw.startswith(b'{'):
+            if raw.startswith(b'{'):
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    payload = {}
+                code = payload.get('status_code') if isinstance(payload, dict) else None
+                if code not in (0, None):
+                    # An unknown non-zero code: not spooled (only 8196 is), but the code and
+                    # message are the diagnosis when profiles stop arriving.
+                    logger.warning('resolver rejected handle: status_code=%s status_msg=%s', code,
+                                   str(payload.get('status_msg', ''))[:120])
+            elif not raw.startswith(b'{'):
                 # Shape only: a non-JSON resolver reply is how throttling or a
                 # format change would first show up.
                 logger.warning('resolver reply not JSON: http=%s bytes=%d orcas=%s ctype=%s%s', response.status_code,

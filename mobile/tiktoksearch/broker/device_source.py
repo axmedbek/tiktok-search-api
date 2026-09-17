@@ -48,7 +48,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from ..device.driver import DeviceDriver, DeviceProfile
-from ..device.errors import DeviceError, HarvestTimeout, ProfileUnavailable
+from ..device.errors import DeviceError, DeviceThrottled, HarvestTimeout, ProfileUnavailable
 from ..mapping import flatten_video, to_int
 from .api_client import ApiCallError, ApiClient, Failure
 from .envelope import page_envelopes
@@ -67,6 +67,8 @@ PROFILE_SOURCE_DEVICE = 'device'
 # Pseudo-status on a harvest timeout so the consumer can count attempts per job
 # the way it counts 502s; not an HTTP status the API ever answers.
 DEVICE_TIMEOUT_STATUS = 598
+# Risk control refused the app's resolver: long backoff, never a give-up.
+DEVICE_THROTTLED_STATUS = 599
 RESOLVED_VIA = 'device'
 # `label` on this module's events; the consumer spells its page label
 # `<queue> page_id=<n>`, this is the same suffix without the queue.
@@ -127,7 +129,8 @@ class DevicePageSource:
             # timeout, a dead container, an unreadable body — is transient, so
             # the consumer's existing ack table requeues the job instead of
             # acking it with nothing published.
-            raise ApiCallError(Failure.TRANSIENT, f'device harvest failed: {exc}', status=DEVICE_TIMEOUT_STATUS if isinstance(exc, HarvestTimeout) else None) from exc
+            status = DEVICE_THROTTLED_STATUS if isinstance(exc, DeviceThrottled) else DEVICE_TIMEOUT_STATUS if isinstance(exc, HarvestTimeout) else None
+            raise ApiCallError(Failure.TRANSIENT, f'device harvest failed: {exc}', status=status) from exc
         user_id = device_profile.user_id
         profile = profile_dict(device_profile)
         self._emit('page.resolved', label=label, handle=handle, user_id=user_id, sec_uid=device_profile.sec_uid,

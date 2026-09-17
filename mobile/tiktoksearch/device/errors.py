@@ -98,3 +98,12 @@ class ProfileUnavailable(DeviceError):
         super().__init__(message)
         self.status_code = status_code
         self.status_msg = status_msg
+
+
+class DeviceThrottled(DeviceError):
+    """TikTok's risk control refused the app's own handle resolver (0-byte reply).
+
+    Measured 2026-09-17 right after the account hit the daily search cap: the
+    device is temporarily distrusted, so nothing about the handle is known and
+    retrying in seconds only deepens the refusal. Transient, but on the LONG
+    backoff, and never counted toward giving a job up."""

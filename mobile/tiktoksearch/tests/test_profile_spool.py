@@ -49,7 +49,7 @@ class TestHandleResolverResponses:
             body=json.dumps({'status_code': code, 'status_msg': 'Unknown response'}).encode())
         assert entry is None
 
-    @pytest.mark.parametrize('body', [None, b'', b'<html>error</html>', b'[]', b'null', b'{}'])
+    @pytest.mark.parametrize('body', [None, b'<html>error</html>', b'[]', b'null', b'{}'])
     def test_unreadable_reply_yields_no_entry(self, body):
         # Measured 2026-09-17: an unreadable resolver body written under the
         # handle made the driver fail the visit before the profile reply landed.
