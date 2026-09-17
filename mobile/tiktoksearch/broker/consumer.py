@@ -75,7 +75,10 @@ MAX_SOFT_ATTEMPTS = 3
 # otherwise cycles every 50 s forever and trips the supervisor's watchdog into
 # restarting the emulator for everybody else.
 DEVICE_TIMEOUT_STATUS = 598
-GIVE_UP_STATUSES = frozenset((SOFT_ERROR_STATUS, DEVICE_TIMEOUT_STATUS))
+# Timeouts are NOT in this set: while a device is throttled or wedged every job times out, and
+# dropping them after three tries lost real pages (measured 2026-09-17). A timeout retries on
+# the medium backoff for as long as it takes; the supervisor's watchdog heals the rig.
+GIVE_UP_STATUSES = frozenset((SOFT_ERROR_STATUS,))
 NO_IDENTITY_STATUS = 503
 # 429 (`RateLimited`, hit_limit) and 502 (SoftError, hit_shark) come from TikTok: a per-device rate or
 # risk-control window that lifts with TIME, so retrying in seconds only burns
