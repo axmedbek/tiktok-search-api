@@ -88,6 +88,7 @@ BACKOFF_STATUSES = frozenset((429, 502, NO_IDENTITY_STATUS, 598))
 # nothing on our side lifts it before the day rolls, so it takes the long backoff like the pool cap.
 DAILY_SEARCH_CAP_MARKER = 'maximum number of searched today'
 DEVICE_THROTTLED_STATUS = 599
+TAIL_REQUEUE_STATUSES = frozenset((598, DEVICE_THROTTLED_STATUS))
 # The daily cap resets on a UTC day boundary, so retrying in seconds is pure
 # waste. Chosen well under RabbitMQ's default 30-minute `consumer_timeout`:
 # the backoff is spent with the message still UNACKED (see `_nack_after`), and
@@ -252,7 +253,7 @@ class BrokerConsumer:
             self._emit('job.malformed', queue=queue, error=_safe_reason(exc))
             channel.basic_ack(delivery_tag=tag)
         except ApiCallError as exc:
-            self._on_api_failure(channel, tag, queue, label, exc)
+            self._on_api_failure(channel, tag, queue, label, exc, body=body)
         except AMQPError as exc:
             # A publish failure, or the connection going away mid-job. Both of
             # pika's confirm failures are `AMQPError` subclasses (verified:
@@ -285,7 +286,7 @@ class BrokerConsumer:
         self._emit('job.paced', seconds=round(remaining, 3))
         self._connection.sleep(remaining)
 
-    def _on_api_failure(self, channel: Any, tag: int, queue: str, label: str, exc: ApiCallError) -> None:
+    def _on_api_failure(self, channel: Any, tag: int, queue: str, label: str, exc: ApiCallError, *, body: bytes = b'') -> None:
         # Switched on the CLASSIFICATION, never on the bare status: a cap 429
         # and a rate-limit 429 are the same status and need different backoffs
         # (see `api_client.RATE_LIMITED_DETAIL_PREFIX`).
@@ -302,6 +303,17 @@ class BrokerConsumer:
         # The one status-based branch: a 503 is the API saying every warm
         # identity is stale, and that clears on the identity cooldown (minutes),
         # so the short backoff would only hammer it.
+        if exc.status in TAIL_REQUEUE_STATUSES and body:
+            # A device timeout / throttle re-queued in PLACE comes straight back at prefetch 1 and the
+            # backoff sleep blocks the only consumer: measured 2026-09-17, one banned handle held the
+            # whole page queue for 10 minutes. Re-publish it at the TAIL instead and move on; the
+            # job is acked only after the broker confirmed the copy.
+            properties = pika.BasicProperties(content_type=RESULT_CONTENT_TYPE, delivery_mode=DELIVERY_MODE_PERSISTENT)
+            channel.basic_publish(exchange='', routing_key=queue, body=body, properties=properties, mandatory=True)
+            channel.basic_ack(delivery_tag=tag)
+            logger.warning('transient device failure on %s, re-queued at the tail: %s', label, exc)
+            self._emit('job.requeued', queue=queue, label=label, reason=str(exc), retry_in_s=0, to_tail=True)
+            return
         if DAILY_SEARCH_CAP_MARKER in str(exc) or exc.status == DEVICE_THROTTLED_STATUS:
             logger.warning('TikTok daily search cap on %s, requeued after a long backoff: %s', label, exc)
             self._emit('job.requeued', queue=queue, label=label, reason=str(exc), retry_in_s=self._config.long_backoff_s)

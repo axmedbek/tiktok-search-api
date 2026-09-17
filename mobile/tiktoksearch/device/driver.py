@@ -523,6 +523,13 @@ class DeviceDriver:
             raise UnreadableResponse(f'TikTok profile response for handle {name} could not be read '
                                      f'(status_code={entry.status_code})')
         profile = DeviceProfile.from_entry(entry)
+        if profile.aweme_count is None and not profile.private:
+            # MEASURED 2026-09-17 (`@azadhaqq` banned, `@xebermedia.az`): the profile reply of an
+            # unavailable account carries no counters at all and its post feed answers
+            # `aweme_list: null`, which can never be spooled — waiting is a guaranteed timeout.
+            logger.info('handle %s has no post counters (user_id=%s): unavailable account, empty feed', name, profile.user_id)
+            return profile, DeviceFeed(user_id=profile.user_id, aweme_list=(), has_more=False,
+                                       max_cursor=None, captured_at=profile.captured_at)
         if profile.aweme_count == 0 and not profile.private:
             # MEASURED 2026-09-15 (`@medianews_az`, aweme_count 0): the app's
             # post-feed request for an account with no posts answers "No more

@@ -56,7 +56,7 @@ from test_broker_consumer import (  # noqa: E402
 )
 from tiktoksearch.api import app as app_module  # noqa: E402
 from tiktoksearch.broker.api_client import ApiCallError, Failure  # noqa: E402
-from tiktoksearch.broker.consumer import KEYWORD_QUEUE, PAGE_QUEUE, BrokerConsumer, ConsumerConfig  # noqa: E402
+from tiktoksearch.broker.consumer import KEYWORD_QUEUE, PAGE_QUEUE, RESULT_ROUTING_KEY, BrokerConsumer, ConsumerConfig  # noqa: E402
 from tiktoksearch.broker.device_source import (  # noqa: E402
     DEVICE_SOURCE_PREFIX,
     DevicePageSource,
@@ -260,22 +260,27 @@ class TestFailureClassification:
         # `ApiCallError` would ack the job and lose it.
         assert caught.value.failure is Failure.TRANSIENT
 
-    def test_a_timeout_requeues_the_job_with_the_medium_backoff(self):
+    def test_a_timeout_requeues_the_job_at_the_tail(self):
+        # Re-queued in PLACE it comes straight back at prefetch 1 and the backoff sleep blocks the
+        # only consumer (measured 2026-09-17: one banned handle held the page queue for 10 min).
+        # So the job is re-published at the TAIL of its own queue and the original acked.
         api = FakeApi(profile=PROFILE_PAYLOAD)
         page_source = DevicePageSource(api, FakeDriver(HarvestTimeout('no response')))
         _consumer, channel, connection = run_consumer([(PAGE_QUEUE, page_body())], api,
                                                       page_source=page_source, config=BACKOFFS)
-        assert channel.nacked == [(1, True)]
-        assert channel.acked == []
-        # MEDIUM, not SHORT: a timeout re-fired every 5 s hammered the app's resolver (measured 2026-09-17).
-        assert connection.sleeps == [BACKOFFS.medium_backoff_s] and LONG not in connection.sleeps
-        assert channel.published == [], 'nothing may be published for a visit that failed'
+        assert channel.nacked == []
+        assert channel.acked == [1]
+        assert connection.sleeps == []
+        assert len(channel.published) == 1
+        copy = channel.published[0]
+        assert copy['routing_key'] == PAGE_QUEUE and copy['exchange'] == ''
+        assert copy['body'] == page_body()
 
-    def test_a_timeout_is_never_acked_as_a_job_that_found_nothing(self):
+    def test_a_timeout_never_publishes_a_result(self):
         api = FakeApi(profile=PROFILE_PAYLOAD)
         page_source = DevicePageSource(api, FakeDriver(HarvestTimeout('no response')))
         channel = run_consumer([(PAGE_QUEUE, page_body())], api, page_source=page_source)[1]
-        assert channel.acked == []
+        assert all(m['routing_key'] != RESULT_ROUTING_KEY for m in channel.published)
 
     def test_an_empty_feed_is_a_success_that_publishes_nothing_and_acks(self):
         # The OTHER side of the same coin: a real response with an empty

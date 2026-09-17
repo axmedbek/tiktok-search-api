@@ -243,7 +243,8 @@ def test_unknown_resolver_error_is_requeued_instead_of_losing_the_job(tmp_path):
     BrokerConsumer(SETTINGS, api, config=BACKOFFS, connect=lambda settings: connection,
                    page_source=source).run()
 
-    assert channel.acked == [] and channel.published == []
-    assert channel.nacked == [(1, True)]
-    # A harvest timeout takes the MEDIUM backoff: retrying in seconds only re-hammers the resolver.
-    assert connection.sleeps == [BACKOFFS.medium_backoff_s]
+    # A harvest timeout is re-published at the tail of the page queue (never to the result
+    # routing key) and the original delivery is acked, so one stuck handle cannot block the queue.
+    assert channel.nacked == [] and channel.acked == [1]
+    assert [m['routing_key'] for m in channel.published] == [PAGE_QUEUE]
+    assert connection.sleeps == []
