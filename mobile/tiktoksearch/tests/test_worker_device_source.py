@@ -260,14 +260,15 @@ class TestFailureClassification:
         # `ApiCallError` would ack the job and lose it.
         assert caught.value.failure is Failure.TRANSIENT
 
-    def test_a_timeout_requeues_the_job_with_the_short_backoff(self):
+    def test_a_timeout_requeues_the_job_with_the_medium_backoff(self):
         api = FakeApi(profile=PROFILE_PAYLOAD)
         page_source = DevicePageSource(api, FakeDriver(HarvestTimeout('no response')))
         _consumer, channel, connection = run_consumer([(PAGE_QUEUE, page_body())], api,
                                                       page_source=page_source, config=BACKOFFS)
         assert channel.nacked == [(1, True)]
         assert channel.acked == []
-        assert connection.sleeps == [SHORT] and LONG not in connection.sleeps
+        # MEDIUM, not SHORT: a timeout re-fired every 5 s hammered the app's resolver (measured 2026-09-17).
+        assert connection.sleeps == [BACKOFFS.medium_backoff_s] and LONG not in connection.sleeps
         assert channel.published == [], 'nothing may be published for a visit that failed'
 
     def test_a_timeout_is_never_acked_as_a_job_that_found_nothing(self):

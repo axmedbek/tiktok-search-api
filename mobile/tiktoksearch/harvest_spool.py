@@ -529,10 +529,17 @@ class ProfileEntry:
         raw_code = payload.get(FIELD_STATUS_CODE)
         # Do not truncate a malformed float or coerce bool into a status code.
         status_code = _as_int(raw_code) if isinstance(raw_code, (str, int)) and not isinstance(raw_code, bool) else None
-        if status_code == 0:
+        if status_code != INVALID_UNIQUE_ID_CODE:
+            # Only the CONFIRMED rejection is worth a profile entry. Anything
+            # else — a success, an unfamiliar code, an unreadable body
+            # (measured 2026-09-17: `status_code` absent, both instances,
+            # `@bakidyp`) — must not be written under the handle, because the
+            # driver reads the newest entry for the handle as THE profile
+            # answer and would fail the visit before the real profile reply
+            # (which follows within a second) ever lands.
             return None
         handle = _param_from_url(url, UNIQUE_ID_PARAM).strip().lower()
-        status = STATUS_UNAVAILABLE if status_code == INVALID_UNIQUE_ID_CODE else STATUS_ERROR
+        status = STATUS_UNAVAILABLE
         return cls(handle=handle, captured_at=float(captured_at), status=status, status_code=status_code,
                    status_msg=_str_or_none(payload.get(FIELD_STATUS_MSG)), user_id=None, sec_uid=None,
                    username=None, nickname=None, avatar_url=None, follower_count=None,

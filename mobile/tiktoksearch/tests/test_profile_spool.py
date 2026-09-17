@@ -41,21 +41,19 @@ class TestHandleResolverResponses:
         assert read_back.is_unavailable
 
     @pytest.mark.parametrize('code', [8197, 2065, 'error', None, True, False, 8196.5, '8196.5'])
-    def test_unknown_or_malformed_code_is_retryable(self, code):
+    def test_unknown_or_malformed_code_yields_no_entry(self, code):
+        # Only the confirmed 8196 rejection is written under the handle; any
+        # other code leaves the real profile reply as the only answer.
         entry = ProfileEntry.from_resolver_response(
             url=RESOLVE_URL, captured_at=100.0,
             body=json.dumps({'status_code': code, 'status_msg': 'Unknown response'}).encode())
-        assert entry is not None
-        assert entry.handle == 'demo.user'
-        assert entry.status == STATUS_ERROR
-        assert not entry.is_unavailable and not entry.is_ok
+        assert entry is None
 
     @pytest.mark.parametrize('body', [None, b'', b'<html>error</html>', b'[]', b'null', b'{}'])
-    def test_unreadable_reply_still_correlates_with_the_requested_handle(self, body):
-        entry = ProfileEntry.from_resolver_response(url=RESOLVE_URL, captured_at=100.0, body=body)
-        assert entry is not None
-        assert entry.handle == 'demo.user'
-        assert entry.status == STATUS_ERROR and not entry.is_unavailable
+    def test_unreadable_reply_yields_no_entry(self, body):
+        # Measured 2026-09-17: an unreadable resolver body written under the
+        # handle made the driver fail the visit before the profile reply landed.
+        assert ProfileEntry.from_resolver_response(url=RESOLVE_URL, captured_at=100.0, body=body) is None
 
     @pytest.mark.parametrize('code', [0, '0'])
     def test_resolver_success_does_not_masquerade_as_a_profile(self, code):

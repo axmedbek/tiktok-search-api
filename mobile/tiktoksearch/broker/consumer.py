@@ -80,7 +80,10 @@ NO_IDENTITY_STATUS = 503
 # 429 (`RateLimited`, hit_limit) and 502 (SoftError, hit_shark) come from TikTok: a per-device rate or
 # risk-control window that lifts with TIME, so retrying in seconds only burns
 # signed requests. Both statuses take the medium backoff.
-BACKOFF_STATUSES = frozenset((429, 502, NO_IDENTITY_STATUS))
+BACKOFF_STATUSES = frozenset((429, 502, NO_IDENTITY_STATUS, 598))
+# TikTok's own wording for the per-account DAILY search cap (measured 2026-09-17 on `/search`):
+# nothing on our side lifts it before the day rolls, so it takes the long backoff like the pool cap.
+DAILY_SEARCH_CAP_MARKER = 'maximum number of searched today'
 # The daily cap resets on a UTC day boundary, so retrying in seconds is pure
 # waste. Chosen well under RabbitMQ's default 30-minute `consumer_timeout`:
 # the backoff is spent with the message still UNACKED (see `_nack_after`), and
@@ -295,6 +298,11 @@ class BrokerConsumer:
         # The one status-based branch: a 503 is the API saying every warm
         # identity is stale, and that clears on the identity cooldown (minutes),
         # so the short backoff would only hammer it.
+        if DAILY_SEARCH_CAP_MARKER in str(exc):
+            logger.warning('TikTok daily search cap on %s, requeued after a long backoff: %s', label, exc)
+            self._emit('job.requeued', queue=queue, label=label, reason=str(exc), retry_in_s=self._config.long_backoff_s)
+            self._nack_after(channel, tag, self._config.long_backoff_s)
+            return
         if exc.status in GIVE_UP_STATUSES:
             attempts = self._soft_attempts.get(label, 0) + 1
             self._soft_attempts[label] = attempts

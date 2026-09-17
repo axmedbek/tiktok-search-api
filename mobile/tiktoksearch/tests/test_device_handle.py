@@ -55,11 +55,18 @@ class Clock:
         self.now += seconds
 
 
-def resolver_entry(handle: str, *, at: float, body: bytes | None = NOT_FOUND_BODY) -> ProfileEntry:
+def resolver_entry(handle: str, *, at: float, body: bytes | None = NOT_FOUND_BODY) -> ProfileEntry | None:
+    # None for anything but the confirmed 8196 rejection: an unknown or unreadable
+    # resolver reply must NOT land under the handle, or the driver would read it as
+    # the profile answer before the real profile reply arrives.
     url = f'https://api.tiktokv.com{UNIQUE_ID_PATH}?{urlencode({"id": handle})}'
-    entry = ProfileEntry.from_resolver_response(url=url, captured_at=at, body=body)
-    assert entry is not None, 'a resolver failure must produce an observable spool entry'
-    return entry
+    return ProfileEntry.from_resolver_response(url=url, captured_at=at, body=body)
+
+
+def write_resolver(directory: Path, handle: str, *, at: float, body: bytes | None = NOT_FOUND_BODY) -> None:
+    entry = resolver_entry(handle, at=at, body=body)
+    if entry is not None:
+        write_profile_entry(str(directory), entry)
 
 
 def write_profile(directory: Path, clock: Clock, *, handle: str = HANDLE) -> None:
@@ -111,12 +118,14 @@ def test_unknown_or_malformed_resolver_reply_is_transient(tmp_path, body):
     clock = Clock()
 
     def capture(argv, env, timeout_s):
-        write_profile_entry(str(tmp_path), resolver_entry(HANDLE, at=clock(), body=body))
+        write_resolver(tmp_path, HANDLE, at=clock(), body=body)
 
-    with pytest.raises(UnreadableResponse):
+    # Nothing is spooled for the handle, so the visit waits for the real profile
+    # reply and times out — transient, never a permanent rejection.
+    with pytest.raises(HarvestTimeout):
         driver_for(tmp_path, clock, capture).visit_handle(HANDLE, want=50)
 
-    assert clock.sleeps == []
+    assert clock.sleeps
 
 
 def test_a_malformed_profile_response_is_not_a_permanent_account_rejection(tmp_path):
@@ -224,7 +233,7 @@ def test_unknown_resolver_error_is_requeued_instead_of_losing_the_job(tmp_path):
 
     def capture(argv, env, timeout_s):
         body = b'{"status_code":9999,"status_msg":"temporary failure"}'
-        write_profile_entry(str(tmp_path), resolver_entry(HANDLE, at=clock(), body=body))
+        write_resolver(tmp_path, HANDLE, at=clock(), body=body)
 
     api = FakeApi()
     source = DevicePageSource(api, driver_for(tmp_path, clock, capture))
@@ -236,4 +245,5 @@ def test_unknown_resolver_error_is_requeued_instead_of_losing_the_job(tmp_path):
 
     assert channel.acked == [] and channel.published == []
     assert channel.nacked == [(1, True)]
-    assert connection.sleeps == [SHORT]
+    # A harvest timeout takes the MEDIUM backoff: retrying in seconds only re-hammers the resolver.
+    assert connection.sleeps == [BACKOFFS.medium_backoff_s]

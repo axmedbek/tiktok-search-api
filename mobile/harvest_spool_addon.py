@@ -140,6 +140,13 @@ class HarvestSpool:
         # Successful resolution carries no full profile; its later profile
         # response must remain the source of account fields and feed ownership.
         if entry is None:
+            raw = _body(response) or b''
+            if not raw.startswith(b'{'):
+                # Shape only: a non-JSON resolver reply is how throttling or a
+                # format change would first show up.
+                logger.warning('resolver reply not JSON: http=%s bytes=%d orcas=%s ctype=%s%s', response.status_code,
+                               len(raw), response.headers.get('tt_orcas_res'), response.headers.get('content-type'),
+                               _snippet(response) if len(raw) <= MAX_SNIPPET_BYTES else '')
             return
         self._write_profile(entry, path=UNIQUE_ID_PATH)
 
@@ -147,6 +154,15 @@ class HarvestSpool:
         # The handle -> uid resolve the driver waits for. Keyed by the reply's
         # own username, else by the request's `sec_user_id` for an error reply.
         entry = ProfileEntry.from_response(url=url, captured_at=time.time(), body=_body(response))
+        if entry.status != STATUS_OK:
+            # Shape only, plus the head of a SMALL body: an unreadable profile
+            # reply is how a cold / distrusted device shows up (0 bytes with
+            # `tt_orcas_res: 1`), and that is a different fault from a parser gap.
+            raw = _body(response) or b''
+            logger.warning('profile reply unreadable: http=%s bytes=%d orcas=%s ctype=%s%s',
+                           response.status_code, len(raw), response.headers.get('tt_orcas_res'),
+                           response.headers.get('content-type'),
+                           _snippet(response) if len(raw) <= MAX_SNIPPET_BYTES else '')
         self._write_profile(entry, path=PROFILE_PATH)
 
     def _write_profile(self, entry: ProfileEntry, *, path: str) -> None:
