@@ -43,7 +43,10 @@ logger = logging.getLogger('tiktoksearch.capture_record')
 # Hosts that carry the app's API traffic. `capture_identity_addon.py` holds the
 # same list privately; the two addons are independent scripts and that one is
 # not importable from here (it imports mitmproxy at module level).
-TIKTOK_HOST_MARKERS: tuple[str, ...] = ('tiktokv.com', 'tiktok.com', 'byteoversea.com', 'musical.ly')
+# Regional API domains included: an account homed in the EU/US region talks to
+# `api32-normal-useastred.tiktokv.eu` (measured 2026-09-18 on the second redroid
+# device) and a capture that only knew `tiktokv.com` passed it through silently.
+TIKTOK_HOST_MARKERS: tuple[str, ...] = ('tiktokv.com', 'tiktokv.eu', 'tiktokv.us', 'tiktok.com', 'tiktok.eu', 'tiktok.us', 'byteoversea.com', 'musical.ly')
 # Defaults shared with `capture_requests_addon.py`, which is only a hook.
 DEFAULT_CAPTURE_OUT = 'captured_requests.jsonl'
 DEFAULT_CAPTURE_PATH_PREFIX = '/aweme/v1/'

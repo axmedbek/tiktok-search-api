@@ -72,6 +72,7 @@ class HarvestSpool:
         self._dir = default_spool_dir()
         self._path = POST_FEED_PATH
         self._written = 0
+        self._seen_passthrough: set[str] = set()
 
     def load(self, loader) -> None:
         # Option names prefixed `harvest_spool_`, so this addon can be loaded
@@ -86,6 +87,21 @@ class HarvestSpool:
         self._dir = ctx.options.harvest_spool_dir or default_spool_dir()
         self._path = ctx.options.harvest_spool_path or POST_FEED_PATH
         logger.info('spooling %s responses to %s', self._path, self._dir)
+
+    def http_connect(self, flow: http.HTTPFlow) -> None:
+        """Log, once per host, every CONNECT target that the capture will NOT intercept.
+
+        `allow_hosts` passes unknown hosts through untouched and silently, so an
+        app that moved its API to a domain outside the markers (regional
+        `tiktokv.us` / `tiktokv.eu` hosts, measured as a hypothesis on
+        2026-09-18) would simply stop spooling with no error anywhere. The
+        host name is not a secret.
+        """
+        host = flow.request.pretty_host or ''
+        if is_tiktok_host(host) or host in self._seen_passthrough:
+            return
+        self._seen_passthrough.add(host)
+        logger.warning('passthrough (not intercepted): %s', host)
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Strip TikTok's proprietary `ttzip` from `Accept-Encoding` on its API hosts.

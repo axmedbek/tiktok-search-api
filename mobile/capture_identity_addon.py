@@ -45,7 +45,7 @@ from mitmproxy import ctx, http
 logger = logging.getLogger('capture_identity')
 
 # Only these hosts carry the app's authenticated API traffic.
-_TIKTOK_HOST_MARKERS = ('tiktokv.com', 'tiktok.com', 'byteoversea.com', 'musical.ly')
+_TIKTOK_HOST_MARKERS = ('tiktokv.com', 'tiktokv.eu', 'tiktokv.us', 'tiktok.com', 'tiktok.eu', 'tiktok.us', 'byteoversea.com', 'musical.ly')
 
 
 class IdentityCapture:
