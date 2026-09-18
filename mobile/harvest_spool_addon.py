@@ -87,6 +87,24 @@ class HarvestSpool:
         self._path = ctx.options.harvest_spool_path or POST_FEED_PATH
         logger.info('spooling %s responses to %s', self._path, self._dir)
 
+    def request(self, flow: http.HTTPFlow) -> None:
+        """Strip TikTok's proprietary `ttzip` from `Accept-Encoding` on its API hosts.
+
+        MEASURED 2026-09-18 on the redroid (Android 13, arm64) device: TTNet
+        advertises `ttzip` and the profile/posts replies come back
+        `content-encoding: ttzip`, which mitmproxy cannot decode (every body
+        reads as 0 bytes). Without the token the server answers gzip, which is
+        what the LDPlayer device always received. Request-side only; nothing
+        else about the request is touched.
+        """
+        if not is_tiktok_host(flow.request.pretty_host or ''):
+            return
+        accept = flow.request.headers.get('accept-encoding')
+        if not accept or 'ttzip' not in accept.lower():
+            return
+        kept = [token.strip() for token in accept.split(',') if token.strip() and not token.strip().lower().startswith('ttzip')]
+        flow.request.headers['accept-encoding'] = ', '.join(kept) or 'gzip'
+
     def response(self, flow: http.HTTPFlow) -> None:
         if flow.response is None:
             return
@@ -171,8 +189,9 @@ class HarvestSpool:
             # reply is how a cold / distrusted device shows up (0 bytes with
             # `tt_orcas_res: 1`), and that is a different fault from a parser gap.
             raw = _body(response) or b''
-            logger.warning('profile reply unreadable: http=%s bytes=%d orcas=%s ctype=%s%s',
-                           response.status_code, len(raw), response.headers.get('tt_orcas_res'),
+            logger.warning('profile reply unreadable: http=%s bytes=%d raw=%d enc=%s te=%s clen=%s orcas=%s ctype=%s%s',
+                           response.status_code, len(raw), len(response.raw_content or b''), response.headers.get('content-encoding'),
+                           response.headers.get('transfer-encoding'), response.headers.get('content-length'), response.headers.get('tt_orcas_res'),
                            response.headers.get('content-type'),
                            _snippet(response) if len(raw) <= MAX_SNIPPET_BYTES else '')
         self._write_profile(entry, path=PROFILE_PATH)
