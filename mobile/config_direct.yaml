@@ -31,14 +31,19 @@ signer: local
 # From the RAPIDAPI_KEY env var / .env (see .env.example) — the env var wins.
 rapidapi_key:
 rapidapi_host: tiktok-api-signer.p.rapidapi.com
-# The search gateway must match the identity's home region: an identity captured
-# from a US-region account (device_query region=US) got `HTTP 403` with an empty
-# body on the alisg host and results on the useast5 `.us` host, measured
-# 2026-09-21 with one request per host (same signer, same identity); the earlier
-# accounts were alisg-homed and 403 on nothing. Switch this line when the
-# captured identity's region changes.
-search_host: https://search16-normal-useast5.tiktokv.us
-# search_host (alisg, for an alisg-homed identity): https://search19-normal-alisg.tiktokv.com
+# The search gateway must match the identity's home region, and TikTok can re-home
+# an account while it is logged in. Measured 2026-09-21 with one signed request per
+# host on the same identity and signer: the alisg host answered `HTTP 403` with an
+# empty body, the useast5 `.us` host returned results for ~40 minutes, then (after
+# the app showed its "Pick your plan" consent sheet and the account moved to the
+# EU data centre) the `.us` host answered "Please login your account first" and
+# the useastred/no1a `.eu` hosts returned results. `device_query.region` does not
+# reveal the move (it stayed US). A 403 / "login first" on the search host is
+# triaged as region/gateway before signer or hit_shark; switch this line to the
+# host that answers.
+search_host: https://search16-normal-useastred.tiktokv.eu
+# search_host (US-homed identity):    https://search16-normal-useast5.tiktokv.us
+# search_host (alisg-homed identity): https://search19-normal-alisg.tiktokv.com
 # Host for the user-scoped endpoints (/aweme/v1/aweme/post/ and
 # /tiktok/user/profile/other/v1). search_host serves ONLY the search paths and
 # 404s these; this is the host the real app calls them on (measured 2026-09-10).
