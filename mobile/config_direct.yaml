@@ -41,7 +41,7 @@ rapidapi_host: tiktok-api-signer.p.rapidapi.com
 # reveal the move (it stayed US). A 403 / "login first" on the search host is
 # triaged as region/gateway before signer or hit_shark; switch this line to the
 # host that answers.
-search_host: https://search19-normal-alisg.tiktokv.com
+search_host: https://search16-normal-useast5.tiktokv.us
 # search_host (US-homed identity):    https://search16-normal-useast5.tiktokv.us
 # search_host (EU-homed identity):    https://search16-normal-useastred.tiktokv.eu
 # Host for the user-scoped endpoints (/aweme/v1/aweme/post/ and
